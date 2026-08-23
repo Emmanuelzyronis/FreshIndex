@@ -1,0 +1,140 @@
+name: cdc-staleness-pipeline
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-catalog}
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - track_commit_timestamp=on
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    networks: [pipeline]
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks: [pipeline]
+
+  meilisearch:
+    image: getmeili/meilisearch:v1.12
+    environment:
+      MEILI_ENV: ${MEILI_ENV:-development}
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:-local-development-master-key}
+    ports:
+      - "${MEILI_PORT:-7700}:7700"
+    volumes:
+      - meilisearch-data:/meili_data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7700/health | grep -q 'available'"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    networks: [pipeline]
+
+  cdc-reader:
+    image: python:3.12-slim
+    working_dir: /workspace
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-catalog}
+      CDC_SLOT: cdc_products_slot
+      CDC_PUBLICATION: cdc_pub
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - .:/workspace:ro
+    command:
+      - sh
+      - -lc
+      - pip install --no-cache-dir -r services/replication-consumer/requirements.txt && python services/replication-consumer/reader.py
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [pipeline]
+
+  indexer:
+    image: python:3.12-slim
+    working_dir: /workspace
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      MEILISEARCH_URL: http://meilisearch:7700
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:-local-development-master-key}
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - .:/workspace:ro
+    command: ["sh", "-lc", "python services/indexer/main.py"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      meilisearch:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [pipeline]
+
+  monitor:
+    image: python:3.12-slim
+    working_dir: /workspace
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-catalog}
+      MEILISEARCH_URL: http://meilisearch:7700
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:-local-development-master-key}
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - .:/workspace:ro
+    command: ["sh", "-lc", "python services/staleness-monitor/main.py"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      meilisearch:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [pipeline]
+
+  loadgen:
+    image: python:3.12-slim
+    working_dir: /workspace
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-catalog}
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - .:/workspace:ro
+    command: ["sh", "-lc", "python load-generator/main.py"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles: [workload]
+    networks: [pipeline]
+
+volumes:
+  postgres-data:
+  redis-data:
+  meilisearch-data:
+
+networks:
+  pipeline:
+    driver: bridge
