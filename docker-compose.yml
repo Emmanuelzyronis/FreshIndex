@@ -112,10 +112,14 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-catalog}
       MEILISEARCH_URL: http://meilisearch:7700
       MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:-local-development-master-key}
+      STALENESS_SLOT: staleness_monitor_slot
+      PORT: 8080
       PYTHONUNBUFFERED: "1"
+    ports:
+      - "${MONITOR_PORT:-8080}:8080"
     volumes:
       - .:/workspace:ro
-    command: ["sh", "-lc", "python services/staleness-monitor/main.py"]
+    command: ["sh", "-lc", "pip install --no-cache-dir -r services/staleness-monitor/requirements.txt && python services/staleness-monitor/main.py"]
     depends_on:
       postgres:
         condition: service_healthy
