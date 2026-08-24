@@ -64,6 +64,7 @@ services:
       CDC_PUBLICATION: cdc_pub
       REDIS_URL: redis://redis:6379/0
       CDC_STREAM: cdc_events
+      PYTHONPATH: /workspace
       PYTHONUNBUFFERED: "1"
     volumes:
       - .:/workspace:ro
@@ -114,6 +115,7 @@ services:
       MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:-local-development-master-key}
       STALENESS_SLOT: staleness_monitor_slot
       PORT: 8080
+      PYTHONPATH: /workspace
       PYTHONUNBUFFERED: "1"
     ports:
       - "${MONITOR_PORT:-8080}:8080"

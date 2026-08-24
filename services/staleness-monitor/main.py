@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import logging
 import os
 import socket
-import sys
 import threading
 import time
 from collections import deque
@@ -18,6 +16,7 @@ from typing import Any
 import meilisearch
 import psycopg2
 from psycopg2.extras import LogicalReplicationConnection, StopReplication
+from services.shared.pgoutput_decoder import PgoutputDecoder
 
 
 def configure_logging() -> None:
@@ -72,15 +71,8 @@ class Monitor:
                 log("monitor_slot_created", slot=self.slot)
 
     def _decoder(self):
-        path = os.path.join(os.path.dirname(__file__), "..", "replication-consumer", "reader.py")
-        spec = importlib.util.spec_from_file_location("cdc_reader", path)
-        if spec is None or spec.loader is None:
-            raise RuntimeError("unable to load pgoutput decoder")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
         database = psycopg2.extensions.parse_dsn(self.dsn).get("dbname", "postgres")
-        return module.PgoutputDecoder(database)
+        return PgoutputDecoder(database)
 
     def observe(self) -> None:
         decoder = self._decoder()
