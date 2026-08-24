@@ -1,9 +1,4 @@
-"""Minimal pgoutput reader.
-
-This stage decodes committed row changes and writes diagnostic JSON to stdout.
-It deliberately does not publish CDCEvent envelopes: published_ts_us must be
-the timestamp of a real Redis XADD, which belongs to the next stage.
-"""
+"""Minimal pgoutput reader and Redis Streams publisher."""
 
 from __future__ import annotations
 
@@ -18,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import psycopg2
+import redis
 from psycopg2.extras import LogicalReplicationConnection, StopReplication
 
 
@@ -244,6 +240,8 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--dsn", default=os.environ.get("DATABASE_URL"))
     parser.add_argument("--slot", default=os.environ.get("CDC_SLOT", "cdc_products_slot"))
     parser.add_argument("--publication", default=os.environ.get("CDC_PUBLICATION", "cdc_pub"))
+    parser.add_argument("--redis-url", default=os.environ.get("REDIS_URL", "redis://localhost:6379/0"))
+    parser.add_argument("--stream", default=os.environ.get("CDC_STREAM", "cdc_events"))
     parser.add_argument(
         "--stop-after",
         type=int,
@@ -260,6 +258,7 @@ def main() -> int:
     args = arguments()
     database = psycopg2.extensions.parse_dsn(args.dsn).get("dbname", "postgres")
     decoder = PgoutputDecoder(database)
+    redis_client = redis.Redis.from_url(args.redis_url, decode_responses=True)
     emitted = 0
 
     connection = psycopg2.connect(
@@ -270,7 +269,10 @@ def main() -> int:
     def consume(message: Any) -> None:
         nonlocal emitted
         for event in decoder.feed(bytes(message.payload)):
-            print(json.dumps(event, separators=(",", ":")), flush=True)
+            event["published_ts_us"] = time.time_ns() // 1_000
+            envelope = json.dumps(event, separators=(",", ":"))
+            redis_client.xadd(args.stream, {"event": envelope})
+            print(envelope, flush=True)
             emitted += 1
         message.cursor.send_feedback(flush_lsn=message.data_start)
         if args.stop_after and emitted >= args.stop_after:
@@ -293,4 +295,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
