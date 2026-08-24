@@ -40,7 +40,26 @@ class Indexer:
         self.consumer = os.environ.get("REDIS_CONSUMER_NAME", socket.gethostname())
         self.redis = redis.Redis.from_url(redis_url, decode_responses=True)
         self.client = meilisearch.Client(meili_url, os.environ.get("MEILI_MASTER_KEY"))
-        self.index = self.client.index(os.environ.get("MEILI_INDEX", "products"))
+        self.index_name = os.environ.get("MEILI_INDEX", "products")
+        self.ensure_index()
+        self.index = self.client.index(self.index_name)
+
+    def ensure_index(self) -> None:
+        try:
+            self.client.get_index(self.index_name)
+        except meilisearch.errors.MeilisearchApiError as exc:
+            if exc.code != "index_not_found":
+                raise
+            task = self.client.create_index(
+                self.index_name, {"primaryKey": "id"}
+            )
+            self.client.wait_for_task(task.task_uid)
+            log("indexer_index_created", index=self.index_name, primary_key="id")
+
+        index = self.client.index(self.index_name)
+        task = index.update_filterable_attributes(["_lsn"])
+        self.client.wait_for_task(task.task_uid)
+        log("indexer_index_configured", index=self.index_name, filterable_attributes=["_lsn"])
 
     def ensure_group(self) -> None:
         try:
