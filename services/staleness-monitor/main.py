@@ -102,13 +102,32 @@ class Monitor:
         with self.lock:
             items = list(self.in_flight.items())
         for key, item in items:
+            age_ms = (now - item.commit_ts_us) / 1_000
+            if age_ms < -60_000 or age_ms > 86_400_000:
+                log("monitor_invalid_commit_timestamp", table=item.table, pk=item.pk,
+                    commit_lsn=item.commit_lsn, commit_ts_us=item.commit_ts_us,
+                    now_ts_us=now, age_ms=round(age_ms, 3))
+                continue
             try:
                 document = self.index.get_document(item.pk)
                 current = document.get("_lsn") if isinstance(document, dict) else getattr(document, "_lsn", None)
-                visible = current is not None and lsn_value(str(current)) >= lsn_value(item.commit_lsn)
+                if current is None:
+                    visible = False
+                    log("monitor_probe_missing_version", table=item.table, pk=item.pk,
+                        commit_lsn=item.commit_lsn)
+                else:
+                    current_lsn = str(current)
+                    visible = lsn_value(current_lsn) >= lsn_value(item.commit_lsn)
+                    if not visible:
+                        log("monitor_probe_wrong_version", table=item.table, pk=item.pk,
+                            commit_lsn=item.commit_lsn, observed_lsn=current_lsn)
             except meilisearch.errors.MeilisearchApiError as exc:
-                visible = False if exc.code == "document_not_found" else (_ for _ in ()).throw(exc)
-            age_ms = (now - item.commit_ts_us) / 1_000
+                if exc.code == "document_not_found":
+                    visible = False
+                    log("monitor_probe_missing_document", table=item.table, pk=item.pk,
+                        commit_lsn=item.commit_lsn)
+                else:
+                    raise
             if visible:
                 item.visible_ts_us = now
                 staleness_ms = (now - item.commit_ts_us) / 1_000
