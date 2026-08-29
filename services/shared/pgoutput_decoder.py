@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import struct
 import time
+import hashlib
 from dataclasses import dataclass
 from typing import Any
 
@@ -93,7 +94,10 @@ class PgoutputDecoder:
             buf.i64(); buf.i64(); self.xid = buf.i32(); self.pending = []; return []
         if tag == "C":
             buf.u8(); commit_lsn = buf.i64(); buf.i64(); commit_ts_us = PG_EPOCH_US + buf.i64()
-            events = [self._committed_event(change, commit_lsn, commit_ts_us) for change in self.pending]
+            events = [
+                self._committed_event(change, commit_lsn, commit_ts_us, sequence)
+                for sequence, change in enumerate(self.pending)
+            ]
             self.pending = []; self.xid = None; return events
         if tag == "R": self._relation(buf); return []
         if tag == "I":
@@ -137,6 +141,18 @@ class PgoutputDecoder:
             else: raise DecodeError(f"unknown tuple data kind {kind!r}")
         return row
 
-    def _committed_event(self, change: RowChange, commit_lsn: int, commit_ts_us: int) -> dict[str, Any]:
+    def _committed_event(
+        self,
+        change: RowChange,
+        commit_lsn: int,
+        commit_ts_us: int,
+        sequence: int,
+    ) -> dict[str, Any]:
         row = change.after if change.after is not None else change.before or {}
-        return {"op": change.op, "source": {"db": self.database, "schema": change.relation.schema, "table": change.relation.table}, "pk": {c.name: row[c.name] for c in change.relation.columns if c.is_key and c.name in row}, "after": change.after, "before": change.before, "commit_lsn": lsn_string(commit_lsn), "commit_ts_us": commit_ts_us, "xid": self.xid, "captured_ts_us": change.captured_ts_us}
+        commit_lsn_string = lsn_string(commit_lsn)
+        identity = (
+            f"{self.database}|{change.relation.schema}|{change.relation.table}|"
+            f"{commit_lsn_string}|{self.xid}|{sequence}"
+        )
+        event_id = hashlib.sha256(identity.encode()).hexdigest()
+        return {"event_id": event_id, "op": change.op, "source": {"db": self.database, "schema": change.relation.schema, "table": change.relation.table}, "pk": {c.name: row[c.name] for c in change.relation.columns if c.is_key and c.name in row}, "after": change.after, "before": change.before, "commit_lsn": commit_lsn_string, "commit_ts_us": commit_ts_us, "xid": self.xid, "captured_ts_us": change.captured_ts_us}

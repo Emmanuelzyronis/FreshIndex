@@ -39,16 +39,22 @@ interval of 100-150 ms.
 
 ## Measurement and Detection
 
-The read-probe is the metric of record. For event `(key=k, commit_lsn=L)`, the
-monitor queries Meilisearch until document `k` is returned with `_lsn >= L`.
+The read-probe is the metric of record. For event
+`(event_id=E, key=k, commit_lsn=L)`, the indexer first waits for the product
+mutation to succeed and then writes marker `E` to the internal Meilisearch
+visibility index. The monitor independently queries Meilisearch until marker
+`E` is readable with commit LSN `L`.
 The timestamp of the first successful probe is `visible_ts_us`; staleness is:
 
 ```text
 visible_ts_us - commit_ts_us
 ```
 
-Meilisearch task `finishedAt` is retained only as a diagnostic proxy. It is not
-authoritative for visibility and cannot satisfy the SLO by itself.
+Meilisearch task completion is used by the indexer to sequence the product and
+marker writes, but is not the measurement. Only the monitor's successful marker
+read establishes `visible_ts_us`. Because the marker is indexed after the
+product task, this is a conservative upper bound on product visibility rather
+than an underestimate.
 
 The monitor polls real Postgres and real Meilisearch directly. It reports every
 observed breach with the event identity, commit LSN, commit timestamp, observed
@@ -61,4 +67,3 @@ The guarantee applies to committed writes for tracked tables, currently the
 `products` table. It assumes the declared production stack is available and
 healthy enough for measurements to be made: Python, Postgres logical
 replication, Redis Streams, Meilisearch, and Docker Compose.
-

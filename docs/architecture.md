@@ -20,15 +20,16 @@ Postgres products -- logical replication (pgoutput) --> replication consumer
                                                         indexer consumer
                                                                |
                                                                v
-                                                           Meilisearch
+                                             Meilisearch products + markers
                                                                ^
                                                                |
                                                 staleness monitor read-probe
 ```
 
 The load generator performs real writes against real Postgres. The monitor
-queries real Postgres and real Meilisearch and does not trust an indexer's
-self-report or Meilisearch task completion as proof of visibility.
+queries real Postgres and independently read-probes immutable Meilisearch
+visibility markers. The indexer writes a marker only after the corresponding
+product mutation succeeds; logs and task responses are not measurements.
 
 ## Domain Schema
 
@@ -65,7 +66,7 @@ reader's decode timestamp, and `published_ts_us` is the Redis `XADD` timestamp.
 ## CDCEvent Envelope
 
 ```yaml
-event_id: ULID
+event_id: deterministic SHA-256 identifier
 op: c | u | d
 source:
   db: string
@@ -82,21 +83,34 @@ captured_ts_us: integer       # reader decode time
 published_ts_us: integer      # XADD time
 ```
 
-`visible_ts_us` is intentionally absent from the payload. The monitor observes
-it through a read-probe.
+`event_id` is derived from the database, relation, commit LSN, transaction ID,
+and transaction-local row-change sequence. Re-reading the same WAL produces the
+same identifier. `visible_ts_us` is intentionally absent from the payload; the
+monitor observes it through a read-probe.
 
 Because replica identity is `DEFAULT`, delete events include the old row only
 to the extent Postgres supplies the key/old identity information; they do not
 promise a full `before` image. Create and update events carry the full `after`
 row.
 
+Postgres may mark unchanged TOAST-backed update values as unavailable. Updates
+therefore use Meilisearch's partial-update operation, preserving existing fields
+that are absent from the decoded tuple. Inserts and tombstones use replacement
+operations.
+
 ## Delivery, Idempotency, and Ordering
 
-Redis Streams delivery is at least once. `commit_lsn` therefore doubles as the
-idempotency token. The indexer stores the last-applied LSN in each Meilisearch
-document's filterable `_lsn` field and ignores an event whose LSN is less than or
-equal to the stored value. Re-delivery is consequently harmless while newer
-LSNs remain authoritative.
+Redis Streams delivery is at least once. The indexer serializes work per product
+with a Redis lock and stores the last-applied LSN in each Meilisearch document's
+filterable `_lsn` field. Older and duplicate events cannot overwrite a newer
+version. Deletes are stored as `_deleted=true` tombstones retaining the LSN, so
+an old upsert cannot resurrect deleted data. Application searches must filter
+`_deleted = false`.
+
+After applying or superseding an event, the indexer adds a marker keyed by
+`event_id` to the internal `cdc_visibility` index. This marker remains available
+after later product versions arrive, allowing the monitor to measure every
+event. Markers are deleted after the configured retention period.
 
 ## Deployment Boundary
 
@@ -114,6 +128,5 @@ cdc-staleness-pipeline/
 ```
 
 This document records the architecture and contracts only. Service
-implementation, fixtures, and test data must use live system boundaries; no
-mocked or fabricated data is permitted.
-
+Integration and SLO verification use live system boundaries. Focused unit tests
+use local fakes only for deterministic failure and ordering behavior.

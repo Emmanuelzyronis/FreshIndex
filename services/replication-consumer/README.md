@@ -1,21 +1,15 @@
-# Replication consumer skeleton
+# Replication consumer
 
-`reader.py` opens the existing `cdc_products_slot` with pgoutput protocol v1,
-tracks relation metadata, buffers row changes until the transaction commit, and
-prints committed changes as JSON diagnostics.
+`reader.py` consumes the PostgreSQL `pgoutput` slot, decodes committed row
+changes, assigns deterministic event IDs, and publishes JSON envelopes to a
+Redis Stream. It acknowledges WAL only after Redis accepts all decoded events
+from the message. The process reconnects with bounded exponential backoff and
+exposes `/health` and `/ready` on its container-internal HTTP port.
 
-It is intentionally not yet a Redis publisher. In particular, it does not
-invent `event_id` or `published_ts_us`; the latter must be captured at a real
-`XADD` in the indexer pipeline stage.
+Required configuration:
 
-Run it with:
-
-```bash
-python reader.py \
-  --dsn postgresql://postgres:postgres@localhost:5432/catalog \
-  --slot cdc_products_slot \
-  --publication cdc_pub
-```
-
-Use `--stop-after 1` for a one-event smoke check.
-
+- `DATABASE_URL`
+- `CDC_SLOT` (default `cdc_products_slot`)
+- `CDC_PUBLICATION` (default `cdc_pub`)
+- `REDIS_URL`
+- `CDC_STREAM` (default `cdc_events`)
