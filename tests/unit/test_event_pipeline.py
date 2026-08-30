@@ -85,6 +85,24 @@ class RecordingRedis:
     def hdel(self, key, field):
         self.deleted.append((key, field))
 
+    def lock(self, *args, **kwargs):
+        return LocalLock()
+
+
+class LocalLock:
+    def acquire(self):
+        return True
+
+    def release(self):
+        return None
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *args):
+        self.release()
+
 
 def envelope(op="d", lsn="0/20"):
     return {
@@ -103,6 +121,20 @@ class EventPipelineTest(unittest.TestCase):
         indexer.index = RecordingIndex()
         indexer.visibility_index = RecordingIndex()
         indexer.client = RecordingClient()
+        indexer.redis = RecordingRedis()
+        indexer.stream = "cdc_events"
+        indexer.group = "indexers"
+        indexer.retry_hash = "cdc_events:retries"
+        indexer.dead_letter_stream = "cdc_events_dlq"
+        indexer.key_lock_seconds = 120
+        import threading
+        indexer.metrics_lock = threading.Lock()
+        indexer.total_lock_wait_ms = 0.0
+        indexer.product_task_count = 0
+        indexer.marker_task_count = 0
+        indexer.processed_events = 0
+        indexer.batch_count = 0
+        indexer.total_processing_ms = 0.0
         indexer.stored_lsn = lambda document_id: stored_lsn
         return indexer
 
@@ -135,6 +167,21 @@ class EventPipelineTest(unittest.TestCase):
         self.assertEqual(result, "applied")
         self.assertEqual(indexer.index.batches, [])
         self.assertEqual(indexer.index.updated_batches[0][0]["_deleted"], False)
+
+    def test_batch_uses_one_product_and_one_marker_task(self):
+        indexer = self.indexer()
+        indexer.redis = RecordingRedis()
+        indexer.current_document = lambda document_id: None
+        messages = [
+            ("1-0", {"event": json.dumps(envelope(op="c", lsn="0/20"))}),
+            ("2-0", {"event": json.dumps({**envelope(op="c", lsn="0/21"), "event_id": "event-2", "pk": {"id": 8}, "after": {"id": 8, "name": "other"}})}),
+        ]
+
+        indexer.process_batch(messages)
+
+        self.assertEqual(len(indexer.index.batches), 1)
+        self.assertEqual(len(indexer.visibility_index.batches), 1)
+        self.assertEqual(len(indexer.visibility_index.batches[0]), 2)
 
     def test_monitor_matches_an_immutable_marker(self):
         observation = Observation("event-1", "products", "7", "d", "0/20", 123, 124)

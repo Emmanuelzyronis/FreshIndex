@@ -19,6 +19,11 @@
 must be `0` in normal operation. A nonzero value intentionally delays every
 event and will cause SLO breaches.
 
+Tune `INDEXER_WORKERS` and `INDEXER_BATCH_SIZE` only after measuring Meilisearch
+CPU, task backlog, Redis pending entries, and p99 staleness. Start with four
+workers and a batch size of 50; scale replicas only when a single instance is
+CPU- or queue-bound rather than when Meilisearch is saturated.
+
 Docker Compose is the reproducible reference deployment. For a multi-host
 production deployment, translate the same health, persistence, secret, and
 shutdown contracts into the chosen orchestrator.

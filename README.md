@@ -89,6 +89,10 @@ endpoints for health checks inside the network.
 - Events that fail repeatedly are moved to `cdc_events_dlq` after five attempts.
 - Visibility markers are written only after the product mutation task succeeds.
 
+The indexer defaults to four bounded workers and batches up to 50 independent
+document IDs. Same-document events still serialize under the Redis lock; a
+batch containing duplicate IDs falls back to the single-event path.
+
 ## Verification
 
 Focused unit verification:
@@ -132,6 +136,8 @@ deployment.
 
 See [docs/operations.md](docs/operations.md) for alerts, backups, recovery,
 retention, dead-letter replay, upgrades, and production rollout checks.
+See [docs/benchmark.md](docs/benchmark.md) for the 1/2/4/8-replica benchmark
+matrix and the exact result files to send back.
 Architecture and guarantee details are in [docs/architecture.md](docs/architecture.md)
 and [docs/guarantee.md](docs/guarantee.md).
 

@@ -79,6 +79,9 @@ class Monitor:
         self.replication_ready = False
         self.probe_ready = False
         self.last_error: str | None = None
+        self.pending_commits: deque[tuple[int, list[tuple[str, str, str, str]]]] = deque()
+        self.replication_cursor: Any = None
+        self.replication_lock = threading.Lock()
 
     def ensure_slot(self) -> None:
         with psycopg2.connect(self.dsn) as conn, conn.cursor() as cur:
@@ -93,7 +96,6 @@ class Monitor:
 
     def observe_once(self) -> None:
         decoder = self._decoder()
-        pending_commits: deque[tuple[int, list[tuple[str, str, str, str]]]] = deque()
         conn = psycopg2.connect(
             self.dsn,
             connection_factory=LogicalReplicationConnection,
@@ -104,12 +106,6 @@ class Monitor:
         def consume(message: Any) -> None:
             if self.stop_event.is_set():
                 raise StopReplication
-            with self.lock:
-                while pending_commits and all(
-                    key not in self.in_flight for key in pending_commits[0][1]
-                ):
-                    flush_lsn, _ = pending_commits.popleft()
-                    message.cursor.send_feedback(flush_lsn=flush_lsn)
             event_keys: list[tuple[str, str, str, str]] = []
             payload = bytes(message.payload)
             for event in decoder.feed(payload):
@@ -139,10 +135,11 @@ class Monitor:
                         commit_ts_us=item.commit_ts_us,
                     )
             if payload[:1] == b"C":
-                pending_commits.append((message.data_start, event_keys))
+                with self.lock:
+                    self.pending_commits.append((message.data_start, event_keys))
                 if not event_keys:
-                    flush_lsn, _ = pending_commits.popleft()
-                    message.cursor.send_feedback(flush_lsn=flush_lsn)
+                    with self.replication_lock:
+                        message.cursor.send_feedback(flush_lsn=message.data_start)
 
         try:
             cursor.start_replication(
@@ -152,6 +149,7 @@ class Monitor:
                 status_interval=5,
             )
             self.replication_ready = True
+            self.replication_cursor = cursor
             self.last_error = None
             log("monitor_replication_started", slot=self.slot, host=socket.gethostname())
             cursor.consume_stream(consume, keepalive_interval=1)
@@ -159,6 +157,9 @@ class Monitor:
             pass
         finally:
             self.replication_ready = False
+            self.replication_cursor = None
+            with self.lock:
+                self.pending_commits.clear()
             cursor.close()
             conn.close()
 
@@ -286,6 +287,7 @@ class Monitor:
                 "p50_staleness_ms": self.percentile(values, 0.50),
                 "p95_staleness_ms": self.percentile(values, 0.95),
                 "p99_staleness_ms": self.percentile(values, 0.99),
+                "max_staleness_ms": round(max(values), 3) if values else None,
                 "in_flight_count": len(ages),
                 "oldest_in_flight_age_ms": round(max(ages), 3) if ages else None,
                 "violation_count": self.violation_count,
@@ -303,6 +305,7 @@ class Monitor:
             "p50_staleness_ms": "cdc_staleness_p50_milliseconds",
             "p95_staleness_ms": "cdc_staleness_p95_milliseconds",
             "p99_staleness_ms": "cdc_staleness_p99_milliseconds",
+            "max_staleness_ms": "cdc_staleness_max_milliseconds",
             "in_flight_count": "cdc_staleness_in_flight",
             "oldest_in_flight_age_ms": "cdc_staleness_oldest_in_flight_milliseconds",
             "violation_count": "cdc_staleness_violations_total",
@@ -317,6 +320,7 @@ class Monitor:
 
     def run(self) -> None:
         threading.Thread(target=self.probe_loop, daemon=True).start()
+        threading.Thread(target=self.ack_loop, daemon=True).start()
         log("monitor_started", slot=self.slot, host=socket.gethostname())
         self.observe()
 
@@ -330,6 +334,19 @@ class Monitor:
                 logging.exception(
                     json.dumps({"event": "monitor_probe_error"}, separators=(",", ":"))
                 )
+            self.stop_event.wait(self.poll_seconds)
+
+    def ack_loop(self) -> None:
+        while not self.stop_event.is_set():
+            with self.lock:
+                while self.pending_commits and all(
+                    key not in self.in_flight for key in self.pending_commits[0][1]
+                ):
+                    flush_lsn, _ = self.pending_commits.popleft()
+                    cursor = self.replication_cursor
+                    if cursor is not None:
+                        with self.replication_lock:
+                            cursor.send_feedback(flush_lsn=flush_lsn)
             self.stop_event.wait(self.poll_seconds)
 
 
