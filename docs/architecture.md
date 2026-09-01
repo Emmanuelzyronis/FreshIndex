@@ -117,7 +117,7 @@ event. Markers are deleted after the configured retention period.
 The repository is organized as:
 
 ```text
-cdc-staleness-pipeline/
+FreshIndex/
 ├── README.md
 ├── docker-compose.yml
 ├── docs/{guarantee.md, architecture.md, limits.md}

@@ -1,4 +1,4 @@
-# Bounded-Staleness CDC Pipeline
+# FreshIndex
 
 A reference change-data-capture pipeline that reads committed PostgreSQL row
 changes from logical WAL, delivers them through Redis Streams, applies ordered
@@ -537,12 +537,12 @@ set -a
 . ./.env
 set +a
 docker run --rm \
-  --network cdc-staleness-pipeline_pipeline \
+  --network freshindex_pipeline \
   -v "$PWD:/repo:ro" -w /repo -e PYTHONPATH=/repo \
   -e RUN_INTEGRATION=1 \
   -e DATABASE_URL="postgresql://$WRITER_DB_USER:$WRITER_DB_PASSWORD@postgres:5432/$POSTGRES_DB" \
   -e MONITOR_URL=http://monitor:8080/staleness \
-  cdc-staleness-pipeline-cdc-reader \
+  freshindex-cdc-reader \
   python -m unittest tests.integration.test_pipeline -v
 ```
 
