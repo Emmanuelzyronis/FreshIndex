@@ -51,7 +51,8 @@ def run(args: argparse.Namespace) -> int:
     started = time.monotonic()
     next_write = started
 
-    with psycopg2.connect(args.dsn, application_name="cdc-load-generator") as connection:
+    connection = psycopg2.connect(args.dsn, application_name="cdc-load-generator")
+    try:
         connection.autocommit = True
         with connection.cursor() as cursor:
             while not stopped and (args.duration == 0 or time.monotonic() - started < args.duration):
@@ -104,6 +105,8 @@ def run(args: argparse.Namespace) -> int:
                     operation = "delete"
                 log("loadgen_write", sequence=sequence, operation=operation, product_id=product_id)
                 next_write += 1.0 / args.rate
+    finally:
+        connection.close()
 
     log("loadgen_finished", writes=sequence, duration_seconds=round(time.monotonic() - started, 3))
     return 0
