@@ -1,0 +1,26 @@
+{
+  "name": "freshindex-film",
+  "version": "1.0.0",
+  "private": true,
+  "description": "FreshIndex portfolio film — deterministic WebGL narrative built with Remotion",
+  "scripts": {
+    "studio": "remotion studio src/index.ts",
+    "spike": "remotion render src/index.ts Spike out/spike --frames=0-89",
+    "render": "remotion render src/index.ts FreshIndexFilm out/freshindex-film.mp4",
+    "render:short": "remotion render src/index.ts FreshIndexShort out/freshindex-60.mp4"
+  },
+  "dependencies": {
+    "@remotion/cli": "4.0.524",
+    "@remotion/google-fonts": "^4.0.524",
+    "@remotion/three": "4.0.524",
+    "react": "19.0.0",
+    "react-dom": "19.0.0",
+    "remotion": "4.0.524",
+    "three": "0.170.0"
+  },
+  "devDependencies": {
+    "@types/react": "19.0.0",
+    "@types/three": "0.170.0",
+    "typescript": "5.7.2"
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "fps": 30,
+  "film": [
+    { "key": "coldOpen", "from": 0, "duration": 360 },
+    { "key": "title", "from": 360, "duration": 420 },
+    { "key": "thePath", "from": 780, "duration": 840 },
+    { "key": "lateAndSuperseded", "from": 1620, "duration": 780 },
+    { "key": "pileUp", "from": 2400, "duration": 780 },
+    { "key": "recovery", "from": 3180, "duration": 480 },
+    { "key": "theWitness", "from": 3660, "duration": 480 },
+    { "key": "evidence", "from": 4140, "duration": 300 },
+    { "key": "close", "from": 4440, "duration": 120 }
+  ],
+  "short": [
+    { "key": "coldOpen", "from": 0, "duration": 150 },
+    { "key": "thePath", "from": 150, "duration": 300 },
+    { "key": "lateAndSuperseded", "from": 450, "duration": 300 },
+    { "key": "pileUp", "from": 750, "duration": 300 },
+    { "key": "recovery", "from": 1050, "duration": 210 },
+    { "key": "theWitness", "from": 1260, "duration": 240 },
+    { "key": "evidence", "from": 1500, "duration": 180 },
+    { "key": "close", "from": 1680, "duration": 120 }
+  ]
+}

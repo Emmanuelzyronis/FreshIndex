@@ -1,0 +1,6 @@
+node_modules/
+
+# Render output: the mp4s, the synthesised score, segment intermediates, and
+# verification stills. All of it is reproducible from src/ + scripts/.
+out/
+.remotion/
