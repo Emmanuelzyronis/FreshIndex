@@ -141,7 +141,18 @@ class Indexer:
             if exc.code == "document_not_found":
                 return None
             raise
-        return document if isinstance(document, dict) else dict(document.__dict__)
+        if isinstance(document, dict):
+            return document
+        # meilisearch-python returns a Document model, not a plain dict. The
+        # 0.31.x model keeps the raw payload under a mangled private slot
+        # (_Document__doc) next to the real fields, so __dict__ must never be
+        # copied wholesale: that would leak SDK internals into documents that
+        # are merged and written back to Meilisearch.
+        return {
+            key: value
+            for key, value in document.__dict__.items()
+            if key != "_Document__doc"
+        }
 
     def apply(self, envelope: dict[str, Any]) -> str:
         document_id = envelope["pk"]["id"]

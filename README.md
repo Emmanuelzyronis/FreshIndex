@@ -404,8 +404,19 @@ bind only to `127.0.0.1`.
 │   ├── staleness-monitor/
 │   └── shared/pgoutput_decoder.py
 ├── load-generator/
-└── tests/{unit,integration,slo}/
+├── tests/{unit,integration,slo}/
+└── demo/                  # portfolio evidence harness (see demo/README.md)
 ```
+
+## Portfolio demo harness
+
+`demo/` is a repeatable, single-command evidence demonstration of the real
+pipeline: happy path (Scenario A), same-row ordering with superseded-event
+evidence (Scenario B), SLO verification against the live monitor, and
+indexer failure/recovery (Scenario C). It produces a structured JSON evidence
+bundle under `demo/artifacts/` with no mock data and no secrets. Run it with
+`bash demo/run.sh`; see `demo/README.md` for the full procedure and honest
+limitations.
 
 ## Prerequisites and setup
 

@@ -89,6 +89,30 @@ class RecordingRedis:
         return LocalLock()
 
 
+class SdkDocumentLike:
+    """Mimic meilisearch-python 0.31's Document model surface.
+
+    The SDK stores the raw payload under a mangled private slot
+    (_Document__doc) and copies each document field onto the instance, so its
+    __dict__ mixes real fields with internal state.
+    """
+
+    def __init__(self, fields):
+        self.__dict__["_Document__doc"] = dict(fields)
+        self.__dict__.update(fields)
+
+
+class GetDocumentIndex(RecordingIndex):
+    def __init__(self, current):
+        super().__init__()
+        self.current = current
+
+    def get_document(self, document_id):
+        if str(document_id) == "7":
+            return self.current
+        raise RuntimeError("unexpected document id in test")
+
+
 class LocalLock:
     def acquire(self):
         return True
@@ -182,6 +206,53 @@ class EventPipelineTest(unittest.TestCase):
         self.assertEqual(len(indexer.index.batches), 1)
         self.assertEqual(len(indexer.visibility_index.batches), 1)
         self.assertEqual(len(indexer.visibility_index.batches[0]), 2)
+
+    def test_batch_update_merge_never_leaks_sdk_internal_state(self):
+        indexer = self.indexer()
+        indexer.redis = RecordingRedis()
+        current = SdkDocumentLike(
+            {
+                "id": 7,
+                "sku": "sku-7",
+                "name": "old name",
+                "description": "kept by the merge",
+                "category": "books",
+                "price_cents": 100,
+                "in_stock": True,
+                "updated_at": "2026-09-09 10:00:00+00",
+                "_lsn": "0/10",
+                "_deleted": False,
+            }
+        )
+        indexer.index = GetDocumentIndex(current)
+        update = {
+            **envelope(op="u", lsn="0/20"),
+            "after": {"id": 7, "name": "new name"},
+        }
+
+        indexer.process_batch([("1-0", {"event": json.dumps(update)})])
+
+        self.assertEqual(len(indexer.index.batches), 1)
+        merged = indexer.index.batches[0][0]
+        self.assertEqual(
+            merged,
+            {
+                "id": 7,
+                "sku": "sku-7",
+                "name": "new name",
+                "description": "kept by the merge",
+                "category": "books",
+                "price_cents": 100,
+                "in_stock": True,
+                "updated_at": "2026-09-09 10:00:00+00",
+                "_lsn": "0/20",
+                "_deleted": False,
+            },
+        )
+        self.assertFalse(
+            any(key.startswith("_Document__") for key in merged),
+            f"SDK internal state leaked into merged document: {merged}",
+        )
 
     def test_monitor_matches_an_immutable_marker(self):
         observation = Observation("event-1", "products", "7", "d", "0/20", 123, 124)
