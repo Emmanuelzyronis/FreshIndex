@@ -159,7 +159,7 @@ class Indexer:
         with self._lock_for(envelope["pk"]["id"]):
             return self._apply_locked(envelope)
 
-    def _lock_for(self, document_id: Any):
+    def _lock_for(self, document_id: Any) -> Any:
         return self.redis.lock(
             f"{self.stream}:document-lock:{document_id}",
             timeout=self.key_lock_seconds,
@@ -170,25 +170,22 @@ class Indexer:
         document_id = envelope["pk"]["id"]
         incoming_lsn = envelope["commit_lsn"]
         current_lsn = self.stored_lsn(document_id)
-        if current_lsn is not None and lsn_value(incoming_lsn) <= lsn_value(current_lsn):
-            result = "superseded"
-        else:
-            if envelope["op"] == "d":
-                document = {
-                    "id": document_id,
-                    "_lsn": incoming_lsn,
-                    "_deleted": True,
-                }
-            else:
-                document = dict(envelope["after"])
-                document["_lsn"] = incoming_lsn
-                document["_deleted"] = False
+        superseded = current_lsn is not None and lsn_value(incoming_lsn) <= lsn_value(current_lsn)
 
         started_ns = time.perf_counter_ns()
         delay_ms = getattr(self, "processing_delay_ms", 0)
         if delay_ms:
             time.sleep(delay_ms / 1000)
-        if current_lsn is None or lsn_value(incoming_lsn) > lsn_value(current_lsn):
+
+        if superseded:
+            result = "superseded"
+        else:
+            if envelope["op"] == "d":
+                document: dict[str, Any] = {"id": document_id, "_lsn": incoming_lsn, "_deleted": True}
+            else:
+                document = dict(envelope["after"])
+                document["_lsn"] = incoming_lsn
+                document["_deleted"] = False
             if envelope["op"] == "u":
                 task = self.index.update_documents([document], primary_key="id")
             else:
@@ -255,8 +252,7 @@ class Indexer:
 
     def process_message(self, message_id: str, fields: dict[str, str]) -> None:
         dequeue_ts_us = time.time_ns() // 1_000
-        with suppress(Exception):
-            fields["_dequeue_ts_us"] = str(dequeue_ts_us)
+        fields["_dequeue_ts_us"] = str(dequeue_ts_us)
         try:
             envelope = json.loads(fields["event"])
             result = self.apply(envelope)
@@ -323,7 +319,31 @@ class Indexer:
         if not messages:
             return
         batch_started = time.perf_counter_ns()
-        envelopes = [(message_id, fields, json.loads(fields["event"])) for message_id, fields in messages]
+        envelopes = []
+        for message_id, fields in messages:
+            try:
+                envelopes.append((message_id, fields, json.loads(fields["event"])))
+            except Exception as exc:
+                attempts = self.redis.hincrby(self.retry_hash, message_id, 1)
+                logging.exception(
+                    json.dumps(
+                        {"event": "indexer_decode_error", "message_id": message_id, "attempt": attempts},
+                        separators=(",", ":"),
+                    )
+                )
+                if attempts >= self.max_attempts:
+                    self.redis.xadd(
+                        self.dead_letter_stream,
+                        {"source_stream": self.stream, "source_message_id": message_id,
+                         "event": fields.get("event", ""), "error": str(exc),
+                         "attempts": str(attempts), "failed_ts_us": str(time.time_ns() // 1_000)},
+                        maxlen=self.dlq_maxlen, approximate=True,
+                    )
+                    self.redis.xack(self.stream, self.group, message_id)
+                    self.redis.hdel(self.retry_hash, message_id)
+                    log("indexer_dead_lettered", message_id=message_id, attempts=attempts, reason="decode_error")
+        if not envelopes:
+            return
         document_ids = [str(envelope["pk"]["id"]) for _, _, envelope in envelopes]
         if len(set(document_ids)) != len(document_ids):
             for message_id, fields, _ in envelopes:
@@ -552,16 +572,16 @@ class Indexer:
 def serve(indexer: Indexer) -> None:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
-            if self.path not in ("/health", "/ready"):
-                self.send_response(404)
-                body = b"{}"
-            else:
+            if self.path in ("/health", "/ready"):
                 status = 200 if indexer.ready else 503
                 body = json.dumps(
                     {"status": "ok" if indexer.ready else "unavailable", "error": indexer.last_error, **indexer.metrics()},
                     separators=(",", ":"),
                 ).encode()
-                self.send_response(status)
+            else:
+                status = 404
+                body = b"{}"
+            self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()

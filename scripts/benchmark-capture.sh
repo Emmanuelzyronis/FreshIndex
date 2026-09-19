@@ -63,7 +63,7 @@ redis_run() { $REDIS_CMD "$@" 2>/dev/null || echo ""; }
 STREAM_LEN=$(redis_run xlen cdc_events || echo 0)
 DLQ_LEN=$(redis_run xlen cdc_events_dlq || echo 0)
 PENDING_RAW=$(redis_run xpending cdc_events indexers - + 10 2>/dev/null || echo "")
-PENDING_COUNT=$(echo "$PENDING_RAW" | grep -c '^' 2>/dev/null || echo 0)
+PENDING_COUNT=$(echo "$PENDING_RAW" | grep -c '[0-9]' 2>/dev/null || echo 0)
 RETRY_KEYS=$(redis_run hlen cdc_events:retries || echo 0)
 
 # --- PostgreSQL replication slot lags ---------------------------------------

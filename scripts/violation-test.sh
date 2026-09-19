@@ -21,13 +21,12 @@ TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
 ARTIFACT="${ARTIFACT_DIR}/violation-${TIMESTAMP}.json"
 mkdir -p "$ARTIFACT_DIR"
 
-AUTH_HEADER=""
-if [[ -n "${MONITOR_OPS_TOKEN:-}" ]]; then
-  AUTH_HEADER="-H 'Authorization: Bearer ${MONITOR_OPS_TOKEN}'"
-fi
-
 curl_monitor() {
-  curl -fsS --max-time 5 ${AUTH_HEADER:+-H "$AUTH_HEADER"} "${MONITOR_URL}${1}"
+  if [[ -n "${MONITOR_OPS_TOKEN:-}" ]]; then
+    curl -fsS --max-time 5 -H "Authorization: Bearer ${MONITOR_OPS_TOKEN}" "${MONITOR_URL}${1}"
+  else
+    curl -fsS --max-time 5 "${MONITOR_URL}${1}"
+  fi
 }
 
 echo "=== FreshIndex violation detection test ===" >&2
@@ -55,7 +54,7 @@ sleep 10
 
 METRICS=$(curl_monitor /staleness)
 VIOLATIONS=$(echo "$METRICS" | jq '.active_violation_count // 0')
-DETECTION_P99=$(echo "$METRICS" | jq '.detection_delay_p99_ms // null')
+DETECTION_P99=$(echo "$METRICS" | jq '.p99_detection_delay_ms // null')
 P99_STALENESS=$(echo "$METRICS" | jq '.p99_staleness_ms // null')
 
 echo "    Active violations: $VIOLATIONS" >&2
@@ -86,7 +85,7 @@ jq -n \
       violation_detected: ($violations > 0),
       active_violation_count: $violations,
       p99_staleness_ms: $p99_staleness,
-      detection_delay_p99_ms: $detection_p99,
+      p99_detection_delay_ms: $detection_p99,
       detection_within_slo: (if $detection_p99 != null then $detection_p99 <= 500 else null end)
     },
     full_metrics: $metrics

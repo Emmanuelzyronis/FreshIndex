@@ -35,7 +35,6 @@ run() {
 
 PG_USER="${POSTGRES_USER:-postgres}"
 PG_DB="${POSTGRES_DB:-catalog}"
-CDC_USER="${CDC_DB_USER:-cdc_reader}"
 MEILI_URL="${MEILI_URL:-http://localhost:7700}"
 MONITOR_URL="${MONITOR_URL:-http://localhost:8080}"
 

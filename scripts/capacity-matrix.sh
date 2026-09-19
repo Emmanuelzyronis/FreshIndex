@@ -70,8 +70,8 @@ for N in $REPLICAS; do
 
   # Capture artifact
   ARTIFACT=$(MONITOR_URL="$MONITOR_URL" MONITOR_OPS_TOKEN="${MONITOR_OPS_TOKEN:-}" \
-    bash scripts/benchmark-capture.sh "capacity-${N}replicas" 2>/dev/null \
-    | tail -1 | jq -c '.' 2>/dev/null || echo '{}')
+    "$(dirname "$0")/benchmark-capture.sh" "capacity-${N}replicas" 2>/dev/null \
+    | jq -c '.' 2>/dev/null || echo '{}')
 
   RESULTS+=("$ARTIFACT")
   echo "  Done. p99=$(echo "$ARTIFACT" | jq '.staleness.p99_staleness_ms // "n/a"') ms" >&2

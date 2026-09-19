@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import math
@@ -202,9 +203,9 @@ class Monitor:
                     now_ts_us=now,
                     age_ms=round(age_ms, 3),
                 )
-                raise RuntimeError(
-                    f"invalid commit timestamp for event {item.event_id}: age_ms={age_ms}"
-                )
+                with self.lock:
+                    self.in_flight.pop(key, None)
+                continue
             try:
                 marker = self.visibility_index.get_document(item.event_id)
                 visible = self.marker_visible(item, marker)
@@ -353,21 +354,27 @@ class Monitor:
 
     def ack_loop(self) -> None:
         while not self.stop_event.is_set():
+            # Dequeue fully-observed commits under the lock, then send feedback
+            # outside it to avoid holding self.lock while doing socket I/O
+            # (would deadlock with the observe thread which holds replication_lock
+            # then acquires self.lock).
+            to_ack: list[int] = []
             with self.lock:
                 while self.pending_commits and all(
                     key not in self.in_flight for key in self.pending_commits[0][1]
                 ):
                     flush_lsn, _ = self.pending_commits.popleft()
-                    cursor = self.replication_cursor
-                    if cursor is not None:
-                        with self.replication_lock:
-                            cursor.send_feedback(flush_lsn=flush_lsn)
+                    to_ack.append(flush_lsn)
+            for flush_lsn in to_ack:
+                cursor = self.replication_cursor
+                if cursor is not None:
+                    with self.replication_lock:
+                        cursor.send_feedback(flush_lsn=flush_lsn)
             self.stop_event.wait(self.poll_seconds)
 
 
 def _check_bearer(authorization: str | None, token: str) -> bool:
     """Constant-time bearer token check to prevent timing attacks."""
-    import hmac
     if not authorization:
         return False
     parts = authorization.split(" ", 1)
