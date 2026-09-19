@@ -131,7 +131,7 @@ class PgoutputDecoder:
     def _tuple(self, buf: Buffer, relation: Relation) -> dict[str, Any]:
         count = buf.i16()
         if count != len(relation.columns): raise DecodeError(f"tuple has {count} columns; relation has {len(relation.columns)}")
-        row = {}
+        row: dict[str, Any] = {}
         for column in relation.columns:
             kind = chr(buf.u8())
             if kind == "n": row[column.name] = None

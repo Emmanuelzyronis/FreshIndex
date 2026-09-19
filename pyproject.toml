@@ -22,10 +22,12 @@ ignore_missing_imports = true
 warn_unused_ignores = true
 warn_return_any = false
 check_untyped_defs = true
+# services/indexer is the only service in a valid Python package path (no hyphens).
+# Services with hyphenated directory names (replication-consumer, staleness-monitor)
+# and load-generator are checked individually via `mypy file.py` in CI to avoid the
+# "duplicate module named main" collision that occurs when multiple main.py files are
+# resolved without package context.
 files = [
     "services/indexer/main.py",
-    "services/replication-consumer/reader.py",
-    "services/staleness-monitor/main.py",
     "services/shared/pgoutput_decoder.py",
-    "load-generator/main.py",
 ]

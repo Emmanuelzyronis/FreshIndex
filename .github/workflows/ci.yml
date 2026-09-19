@@ -28,7 +28,13 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r services/replication-consumer/requirements.txt -r services/indexer/requirements.txt -r services/staleness-monitor/requirements.txt -r requirements-dev.txt
+      # Check packaged services via pyproject.toml (services/indexer + services/shared).
       - run: mypy --config-file pyproject.toml
+      # Check services whose parent directories have hyphens (not valid Python package
+      # names) individually so mypy does not collide on duplicate "main" module names.
+      - run: mypy --ignore-missing-imports --check-untyped-defs services/replication-consumer/reader.py
+      - run: mypy --ignore-missing-imports --check-untyped-defs services/staleness-monitor/main.py
+      - run: mypy --ignore-missing-imports --check-untyped-defs load-generator/main.py
 
   unit:
     runs-on: ubuntu-latest
