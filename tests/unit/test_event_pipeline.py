@@ -298,6 +298,308 @@ class EventPipelineTest(unittest.TestCase):
         self.assertEqual(first["event_id"], second["event_id"])
         self.assertEqual(len(first["event_id"]), 64)
 
+    # ------------------------------------------------------------------
+    # Pending-reclaim behaviour (EMM-68)
+    # ------------------------------------------------------------------
+
+    def test_reclaim_calls_process_message_for_each_pending_entry(self):
+        indexer = self.indexer()
+        processed = []
+        indexer.process_message = lambda msg_id, fields: processed.append(msg_id)
+
+        class ClaimRedis(RecordingRedis):
+            def xautoclaim(self, stream, group, consumer, **kwargs):
+                # Return (next_start_id, [(msg_id, fields)], [deleted_ids])
+                return ("0-0", [("5-0", {"event": "{}"}), ("6-0", {"event": "{}"})], [])
+
+        indexer.redis = ClaimRedis()
+        indexer.stream = "cdc_events"
+        indexer.group = "indexers"
+        indexer.consumer = "test-consumer"
+        indexer.claim_idle_ms = 30000
+        indexer.metrics_lock = __import__("threading").Lock()
+        indexer.pending_claimed = 0
+
+        count = indexer.reclaim_pending()
+
+        self.assertEqual(count, 2)
+        self.assertEqual(sorted(processed), ["5-0", "6-0"])
+        self.assertEqual(indexer.pending_claimed, 2)
+
+    def test_reclaim_returns_zero_when_no_pending_entries(self):
+        indexer = self.indexer()
+
+        class EmptyClaimRedis(RecordingRedis):
+            def xautoclaim(self, stream, group, consumer, **kwargs):
+                return ("0-0", [], [])
+
+        indexer.redis = EmptyClaimRedis()
+        indexer.stream = "cdc_events"
+        indexer.group = "indexers"
+        indexer.consumer = "test-consumer"
+        indexer.claim_idle_ms = 30000
+        indexer.metrics_lock = __import__("threading").Lock()
+        indexer.pending_claimed = 0
+
+        count = indexer.reclaim_pending()
+
+        self.assertEqual(count, 0)
+        self.assertEqual(indexer.pending_claimed, 0)
+
+    def test_duplicate_events_are_idempotent_via_lsn_ordering(self):
+        # Replaying an event whose LSN is already stored must not overwrite.
+        indexer = self.indexer(stored_lsn="0/30")
+
+        result = indexer.apply(envelope(op="u", lsn="0/20"))
+
+        self.assertEqual(result, "superseded")
+        self.assertEqual(indexer.index.batches, [])
+        self.assertEqual(indexer.index.updated_batches, [])
+
+
+# ------------------------------------------------------------------
+# pgoutput decoder coverage (EMM-75)
+# ------------------------------------------------------------------
+
+import struct  # noqa: E402 — import inside module; acceptable in test file
+
+from services.shared.pgoutput_decoder import DecodeError  # noqa: E402
+
+
+def _make_buf(*parts: bytes) -> bytes:
+    return b"".join(parts)
+
+
+def _i32(n: int) -> bytes:
+    return struct.pack("!i", n)
+
+
+def _i64(n: int) -> bytes:
+    return struct.pack("!q", n)
+
+
+def _u8(n: int) -> bytes:
+    return struct.pack("!B", n)
+
+
+def _cstring(s: str) -> bytes:
+    return s.encode() + b"\x00"
+
+
+def _relation_payload(rel_id: int = 1, schema: str = "public", table: str = "t") -> bytes:
+    # R <rel_id i32> <schema cstring> <table cstring> <replica_identity u8>
+    # <num_columns i16> <flags u8> <col_name cstring> <type_oid i32> <type_mod i32>
+    return (
+        b"R"
+        + _i32(rel_id)
+        + _cstring(schema)
+        + _cstring(table)
+        + _u8(0)  # replica identity = DEFAULT
+        + struct.pack("!h", 1)  # 1 column
+        + _u8(1)  # is_key flag
+        + _cstring("id")
+        + _i32(23)  # int4 OID
+        + _i32(-1)  # type modifier
+    )
+
+
+def _begin_payload(xid: int = 1) -> bytes:
+    # B <final_lsn i64> <commit_ts i64> <xid i32>
+    return b"B" + _i64(0) + _i64(0) + _i32(xid)
+
+
+def _commit_payload() -> bytes:
+    # C <flags u8> <commit_lsn i64> <end_lsn i64> <commit_ts i64>
+    return b"C" + _u8(0) + _i64(32) + _i64(40) + _i64(0)
+
+
+def _insert_payload(rel_id: int = 1, pk_value: int = 7) -> bytes:
+    # I <rel_id i32> N <tuple>
+    value = str(pk_value).encode()
+    return (
+        b"I"
+        + _i32(rel_id)
+        + b"N"
+        + struct.pack("!h", 1)  # 1 column in tuple
+        + b"t"  # text kind
+        + _i32(len(value))
+        + value
+    )
+
+
+class PgoutputDecoderTest(unittest.TestCase):
+    def _decoder_with_relation(self) -> PgoutputDecoder:
+        decoder = PgoutputDecoder("catalog")
+        decoder.feed(_relation_payload())
+        return decoder
+
+    def _full_transaction(self, decoder: PgoutputDecoder, inner: bytes) -> list[dict]:
+        decoder.feed(_begin_payload())
+        decoder.feed(inner)
+        return decoder.feed(_commit_payload())
+
+    def test_begin_returns_empty_and_sets_xid(self):
+        decoder = PgoutputDecoder("catalog")
+        result = decoder.feed(_begin_payload(xid=99))
+        self.assertEqual(result, [])
+        self.assertEqual(decoder.xid, 99)
+
+    def test_relation_is_registered_and_returns_empty(self):
+        decoder = PgoutputDecoder("catalog")
+        result = decoder.feed(_relation_payload(rel_id=5, schema="s", table="t"))
+        self.assertEqual(result, [])
+        self.assertIn(5, decoder.relations)
+        self.assertEqual(decoder.relations[5].table, "t")
+
+    def test_insert_produces_committed_event(self):
+        decoder = self._decoder_with_relation()
+        events = self._full_transaction(decoder, _insert_payload(pk_value=42))
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["op"], "c")
+        self.assertEqual(events[0]["pk"], {"id": 42})
+
+    def test_truncate_passthrough_returns_empty(self):
+        # T (truncate) is silently skipped — it carries no row data we care about.
+        decoder = PgoutputDecoder("catalog")
+        decoder.feed(_begin_payload())
+        result = decoder.feed(b"T" + b"\x00" * 8)  # arbitrary trailing bytes
+        self.assertEqual(result, [])
+
+    def test_type_passthrough_returns_empty(self):
+        decoder = PgoutputDecoder("catalog")
+        decoder.feed(_begin_payload())
+        result = decoder.feed(b"Y" + b"\x00" * 8)
+        self.assertEqual(result, [])
+
+    def test_origin_passthrough_returns_empty(self):
+        decoder = PgoutputDecoder("catalog")
+        decoder.feed(_begin_payload())
+        result = decoder.feed(b"O" + b"\x00" * 8)
+        self.assertEqual(result, [])
+
+    def test_unknown_message_type_raises_decode_error(self):
+        decoder = PgoutputDecoder("catalog")
+        decoder.feed(_begin_payload())
+        with self.assertRaises(DecodeError):
+            decoder.feed(b"Z" + b"\x00" * 4)
+
+    def test_empty_payload_raises_decode_error(self):
+        decoder = PgoutputDecoder("catalog")
+        with self.assertRaises(DecodeError):
+            decoder.feed(b"")
+
+    def test_unknown_relation_id_raises_decode_error(self):
+        decoder = self._decoder_with_relation()
+        decoder.feed(_begin_payload())
+        with self.assertRaises(DecodeError):
+            # Insert referencing rel_id=99 which was never registered
+            decoder.feed(_insert_payload(rel_id=99))
+
+    def test_null_column_value_produces_none(self):
+        decoder = PgoutputDecoder("catalog")
+        # Relation with two columns, second nullable
+        rel_payload = (
+            b"R"
+            + _i32(2)
+            + _cstring("public")
+            + _cstring("products")
+            + _u8(0)
+            + struct.pack("!h", 2)
+            + _u8(1) + _cstring("id") + _i32(23) + _i32(-1)
+            + _u8(0) + _cstring("name") + _i32(25) + _i32(-1)
+        )
+        decoder.feed(rel_payload)
+        insert_payload = (
+            b"I"
+            + _i32(2)
+            + b"N"
+            + struct.pack("!h", 2)
+            + b"t" + _i32(1) + b"5"  # id = 5
+            + b"n"                    # name = NULL
+        )
+        events = self._full_transaction(decoder, insert_payload)
+        self.assertEqual(len(events), 1)
+        self.assertIsNone(events[0]["after"]["name"])
+        self.assertEqual(events[0]["after"]["id"], 5)
+
+    def test_binary_column_value_produces_hex_string(self):
+        decoder = PgoutputDecoder("catalog")
+        rel_payload = (
+            b"R"
+            + _i32(3)
+            + _cstring("public")
+            + _cstring("blobs")
+            + _u8(0)
+            + struct.pack("!h", 1)
+            + _u8(1) + _cstring("data") + _i32(17) + _i32(-1)
+        )
+        decoder.feed(rel_payload)
+        raw_bytes = b"\xde\xad\xbe\xef"
+        insert_payload = (
+            b"I"
+            + _i32(3)
+            + b"N"
+            + struct.pack("!h", 1)
+            + b"b" + _i32(4) + raw_bytes
+        )
+        events = self._full_transaction(decoder, insert_payload)
+        self.assertEqual(events[0]["after"]["data"], raw_bytes.hex())
+
+    def test_integer_oids_are_decoded_as_int(self):
+        decoder = PgoutputDecoder("catalog")
+        for oid, value, expected in [(20, b"9876543210", 9876543210), (21, b"32767", 32767), (23, b"42", 42)]:
+            decoder.relations.clear()
+            rel_payload = (
+                b"R"
+                + _i32(10)
+                + _cstring("public")
+                + _cstring("nums")
+                + _u8(0)
+                + struct.pack("!h", 1)
+                + _u8(1) + _cstring("n") + _i32(oid) + _i32(-1)
+            )
+            decoder.feed(rel_payload)
+            ins = (
+                b"I" + _i32(10) + b"N"
+                + struct.pack("!h", 1)
+                + b"t" + _i32(len(value)) + value
+            )
+            events = self._full_transaction(decoder, ins)
+            self.assertIsInstance(events[0]["after"]["n"], int)
+            self.assertEqual(events[0]["after"]["n"], expected)
+            decoder.pending = []
+
+    def test_boolean_oid_decoded_correctly(self):
+        decoder = PgoutputDecoder("catalog")
+        rel_payload = (
+            b"R"
+            + _i32(11)
+            + _cstring("public")
+            + _cstring("flags")
+            + _u8(0)
+            + struct.pack("!h", 1)
+            + _u8(1) + _cstring("active") + _i32(16) + _i32(-1)
+        )
+        decoder.feed(rel_payload)
+        for raw, expected in [(b"t", True), (b"f", False)]:
+            decoder.pending = []
+            ins = (
+                b"I" + _i32(11) + b"N"
+                + struct.pack("!h", 1)
+                + b"t" + _i32(len(raw)) + raw
+            )
+            events = self._full_transaction(decoder, ins)
+            self.assertEqual(events[0]["after"]["active"], expected)
+
+    def test_uncommitted_pending_is_cleared_on_begin(self):
+        decoder = self._decoder_with_relation()
+        decoder.feed(_begin_payload())
+        decoder.feed(_insert_payload())
+        self.assertEqual(len(decoder.pending), 1)
+        # New BEGIN clears pending from abandoned transaction
+        decoder.feed(_begin_payload(xid=2))
+        self.assertEqual(len(decoder.pending), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

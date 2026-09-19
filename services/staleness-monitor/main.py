@@ -365,14 +365,49 @@ class Monitor:
             self.stop_event.wait(self.poll_seconds)
 
 
+def _check_bearer(authorization: str | None, token: str) -> bool:
+    """Constant-time bearer token check to prevent timing attacks."""
+    import hmac
+    if not authorization:
+        return False
+    parts = authorization.split(" ", 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return False
+    return hmac.compare_digest(parts[1], token)
+
+
 def serve(monitor: Monitor) -> None:
+    # Optional bearer token for /staleness and /metrics. /health and /ready
+    # are intentionally left unauthenticated so orchestrators and load balancers
+    # can probe without credentials.
+    ops_token: str | None = os.environ.get("MONITOR_OPS_TOKEN") or None
+
     class Handler(BaseHTTPRequestHandler):
+        def _require_auth(self) -> bool:
+            """Return True if auth passes or is not configured; send 401 otherwise."""
+            if ops_token is None:
+                return True
+            if _check_bearer(self.headers.get("Authorization"), ops_token):
+                return True
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("WWW-Authenticate", 'Bearer realm="freshindex-monitor"')
+            body = b'{"error":"unauthorized"}'
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return False
+
         def do_GET(self) -> None:
             content_type = "application/json"
             if self.path == "/staleness":
+                if not self._require_auth():
+                    return
                 body = json.dumps(monitor.metrics(), separators=(",", ":")).encode()
                 status = 200
             elif self.path == "/metrics":
+                if not self._require_auth():
+                    return
                 body = monitor.prometheus_metrics().encode()
                 content_type = "text/plain; version=0.0.4"
                 status = 200
