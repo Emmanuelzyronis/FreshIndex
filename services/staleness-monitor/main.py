@@ -300,23 +300,38 @@ class Monitor:
 
     def prometheus_metrics(self) -> str:
         metrics = self.metrics()
-        mapping = {
-            "sample_count": "cdc_staleness_samples_total",
-            "p50_staleness_ms": "cdc_staleness_p50_milliseconds",
-            "p95_staleness_ms": "cdc_staleness_p95_milliseconds",
-            "p99_staleness_ms": "cdc_staleness_p99_milliseconds",
-            "max_staleness_ms": "cdc_staleness_max_milliseconds",
-            "in_flight_count": "cdc_staleness_in_flight",
-            "oldest_in_flight_age_ms": "cdc_staleness_oldest_in_flight_milliseconds",
-            "violation_count": "cdc_staleness_violations_total",
-            "active_violation_count": "cdc_staleness_active_violations",
-            "p99_detection_delay_ms": "cdc_staleness_detection_delay_p99_milliseconds",
-            "violation_duration_seconds": "cdc_staleness_violation_duration_seconds",
-        }
-        return "".join(
-            f"{metric_name} {metrics[key] if metrics[key] is not None else 'NaN'}\n"
-            for key, metric_name in mapping.items()
-        )
+        # Each entry: (json_key, metric_name, type, help_text)
+        definitions = [
+            ("sample_count", "cdc_staleness_samples_total", "counter",
+             "Total CDC staleness samples retained in the rolling window."),
+            ("p50_staleness_ms", "cdc_staleness_p50_milliseconds", "gauge",
+             "Rolling p50 commit-to-search visibility latency in milliseconds."),
+            ("p95_staleness_ms", "cdc_staleness_p95_milliseconds", "gauge",
+             "Rolling p95 commit-to-search visibility latency in milliseconds."),
+            ("p99_staleness_ms", "cdc_staleness_p99_milliseconds", "gauge",
+             "Rolling p99 commit-to-search visibility latency in milliseconds. SLO threshold is 1000 ms."),
+            ("max_staleness_ms", "cdc_staleness_max_milliseconds", "gauge",
+             "Maximum commit-to-search visibility latency in the rolling window, in milliseconds."),
+            ("in_flight_count", "cdc_staleness_in_flight", "gauge",
+             "Number of committed events currently awaiting their visibility marker."),
+            ("oldest_in_flight_age_ms", "cdc_staleness_oldest_in_flight_milliseconds", "gauge",
+             "Age of the oldest unresolved in-flight event in milliseconds."),
+            ("violation_count", "cdc_staleness_violations_total", "counter",
+             "Total SLO violations recorded since monitor start."),
+            ("active_violation_count", "cdc_staleness_active_violations", "gauge",
+             "Number of currently active (unresolved) SLO violations."),
+            ("p99_detection_delay_ms", "cdc_staleness_detection_delay_p99_milliseconds", "gauge",
+             "p99 additional latency beyond the SLO threshold at time of violation detection, in milliseconds."),
+            ("violation_duration_seconds", "cdc_staleness_violation_duration_seconds", "gauge",
+             "Duration of the longest currently active SLO violation in seconds."),
+        ]
+        lines: list[str] = []
+        for key, metric_name, metric_type, help_text in definitions:
+            lines.append(f"# HELP {metric_name} {help_text}\n")
+            lines.append(f"# TYPE {metric_name} {metric_type}\n")
+            value = metrics[key]
+            lines.append(f"{metric_name} {value if value is not None else 'NaN'}\n")
+        return "".join(lines)
 
     def run(self) -> None:
         threading.Thread(target=self.probe_loop, daemon=True).start()

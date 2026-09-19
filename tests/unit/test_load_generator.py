@@ -8,7 +8,6 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-
 load_generator_path = Path(__file__).parents[2] / "load-generator" / "main.py"
 load_generator_spec = importlib.util.spec_from_file_location(
     "load_generator_main", load_generator_path

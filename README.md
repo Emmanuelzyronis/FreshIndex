@@ -3,29 +3,31 @@
 A reference change-data-capture pipeline that reads committed PostgreSQL row
 changes from logical WAL, delivers them through Redis Streams, applies ordered
 versions to Meilisearch, and independently measures commit-to-search
-visibility against a 1000 ms p99 staleness objective.
+visibility against a **1 000 ms p99 staleness objective**.
 
 This repository is infrastructure, not an application UI. It contains the
 database schema, logical-replication reader, Redis-backed indexer, independent
 staleness monitor, Docker Compose deployment, workload generator, and
 verification tests needed to exercise the pipeline end to end.
 
-## Validation status
+---
 
-The pipeline was validated on 2026-09-01 with Docker Compose
-`2.40.3+ds1-0ubuntu1~24.04.1`, PostgreSQL 16.4, Redis 7.4.0, Meilisearch 1.12.0,
-and the repository's default optimized indexer configuration.
+## Validated benchmark
 
-The corrected steady-rate benchmark generated 300 independently committed
-mutations at 5 mutations per second for 60 seconds:
+The pipeline was validated on **2026-09-01** with Docker Compose
+`2.40.3+ds1-0ubuntu1~24.04.1`, PostgreSQL 16.4, Redis 7.4.0, Meilisearch
+1.12.0, and the repository's default optimised indexer configuration.
+
+The corrected steady-rate benchmark generated **300 independently committed
+mutations at 5 mutations/second for 60 seconds**:
 
 | Measurement | Result |
-| --- | ---: |
+|---|---:|
 | Samples | 300 |
-| Throughput | 5.0 committed mutations/second |
+| Throughput | 5.0 committed mutations/s |
 | p50 staleness | 151.994 ms |
 | p95 staleness | 207.060 ms |
-| p99 staleness | 221.839 ms |
+| **p99 staleness** | **221.839 ms** |
 | Maximum staleness | 225.274 ms |
 | Historical violations | 0 |
 | Active violations at completion | 0 |
@@ -34,142 +36,61 @@ mutations at 5 mutations per second for 60 seconds:
 | `cdc_products_slot` WAL lag | 0 bytes |
 | `staleness_monitor_slot` WAL lag | 0 bytes |
 | Final PostgreSQL live row count | 200 |
-| Final Meilisearch `products` document count | 247, including tombstones and retained prior-run data |
+| Final Meilisearch `products` document count | 247 (includes tombstones and retained prior-run data) |
 
-The formal verifier passed the unchanged 1000 ms p99 threshold. All 300
-observations had distinct commit LSNs and distinct commit timestamps. The
-integration test also confirmed that an independently committed insert,
-update, and delete were all measured with no active violation.
+The formal verifier passed the unchanged 1 000 ms p99 threshold. All 300
+observations had distinct commit LSNs and distinct commit timestamps.
 
-These measurements validate this specific Docker Compose deployment and
-workload. They are evidence, not a universal latency guarantee for different
-hardware, data volumes, query load, or deployment topologies.
+> **Note:** These measurements validate this specific Docker Compose deployment
+> and workload. They are evidence, not a universal latency guarantee for
+> different hardware, data volumes, query load, or deployment topologies.
+
+---
 
 ## Problem statement
 
-Search indexes are asynchronous materialized views. A database transaction can
-commit successfully while a search client continues to see an older version,
-or no version, until the indexing pipeline catches up. Basic delivery metrics
-do not answer the important question: how long after the authoritative commit
-did the corresponding change become independently observable in search?
+Search indexes are asynchronous materialised views. A database transaction can
+commit successfully while a search client continues to see an older version, or
+no version, until the indexing pipeline catches up. Basic delivery metrics do
+not answer the important question:
 
-This project addresses that question with three properties:
+> *How long after the authoritative commit did the corresponding change become
+> independently observable in search?*
+
+FreshIndex addresses that question with three properties:
 
 1. PostgreSQL commit metadata is the source of truth for event time and order.
 2. The indexing path is at-least-once but rejects older or duplicate document
    versions by commit LSN.
-3. A separate logical-replication consumer measures visibility by reading an
+3. A **separate** logical-replication consumer measures visibility by reading an
    immutable event marker from Meilisearch after the product mutation succeeds.
 
-## Goals
-
-- Capture committed `products` inserts, updates, and deletes from stock
-  PostgreSQL `pgoutput` logical replication.
-- Preserve authoritative commit LSN and commit timestamp metadata.
-- Deliver events durably through Redis Streams with consumer groups, pending
-  recovery, retry accounting, and a dead-letter stream.
-- Apply document versions to Meilisearch without allowing an older retry to
-  overwrite or resurrect newer state.
-- Represent deletes as versioned tombstones.
-- Measure commit-to-search visibility independently of the reader and indexer.
-- Report a rolling latency distribution and active SLO violations through JSON
-  and Prometheus-compatible endpoints.
-- Provide reproducible unit, integration, workload, SLO, and controlled
-  violation checks.
-
-## Non-goals
-
-- General-purpose CDC for arbitrary schemas or all PostgreSQL data types.
-- Exactly-once transport. Redis delivery is intentionally at least once.
-- A public search API or application query service.
-- Cross-region, multi-host, Kubernetes, or managed-service manifests.
-- An indefinite event audit log. Visibility markers have finite retention.
-- Automatic repair of poison events after they enter the dead-letter stream.
-- Benchmark claims beyond the workload and environment actually tested.
-- The future applications listed later; they do not exist yet.
-
-## Core guarantees and semantics
-
-### Staleness SLO
-
-For committed writes to `public.products`, the stated objective is:
-
-```text
-p99(commit-to-confirmed-search-visibility) <= 1000 ms
-```
-
-If an event remains invisible after 1000 ms, the monitor records a violation.
-Controlled violation testing additionally checks that p99 detection delay is at
-most 500 ms.
-
-### Meaning of staleness
-
-For event `E`:
-
-```text
-staleness(E) = first_successful_marker_probe_ts(E) - postgres_commit_ts(E)
-```
-
-The start is PostgreSQL's transaction commit timestamp decoded from the
-`pgoutput` commit message. It is not the reader receipt time, Redis publish
-time, indexer dequeue time, or Meilisearch task-submission time.
-
-The end is the monitor's first successful read of the event's immutable marker
-from the `cdc_visibility` Meilisearch index. The indexer writes that marker only
-after the product mutation task has completed. Marker visibility is therefore
-a conservative upper bound on product visibility.
-
-### Delivery, ordering, and idempotency
-
-- PostgreSQL commit LSN defines version order.
-- Redis Streams provides at-least-once delivery.
-- Event IDs are deterministic SHA-256 hashes of database, schema, table,
-  commit LSN, transaction ID, and transaction-local row-change sequence.
-- The applied LSN is stored in every Meilisearch product document.
-- Incoming events with an LSN less than or equal to the stored LSN are marked
-  `superseded` and cannot overwrite newer state.
-- Redis locks serialize concurrent work per product ID across workers or
-  replicas.
-- A marker is written for applied and superseded events so each committed event
-  remains measurable.
-
-This makes WAL replay and Redis redelivery idempotent at the document-version
-boundary, but it does not turn Redis transport into exactly-once delivery.
-
-### Delete handling
-
-Deletes are versioned tombstones, not physical removals:
-
-```json
-{"id": 7, "_lsn": "0/20", "_deleted": true}
-```
-
-Retaining `_lsn` prevents an older insert or update from resurrecting a deleted
-document. Application searches must filter tombstones:
-
-```bash
-curl -sS -X POST http://localhost:7700/indexes/products/search \
-  -H "Authorization: Bearer $MEILI_MASTER_KEY" \
-  -H 'Content-Type: application/json' \
-  --data '{"q":"","filter":"_deleted = false"}'
-```
+---
 
 ## Architecture
 
+### High-level data flow
+
 ```mermaid
 flowchart LR
-    W[Writer or load generator] -->|committed SQL transaction| PG[(PostgreSQL 16)]
-    PG -->|cdc_products_slot / pgoutput| R[CDC reader]
-    R -->|XADD cdc_events| RS[(Redis Streams)]
-    RS -->|XREADGROUP / XAUTOCLAIM| I[Indexer workers]
-    I -->|versioned mutation| P[(Meilisearch products)]
-    I -->|immutable marker| V[(Meilisearch cdc_visibility)]
-    PG -->|staleness_monitor_slot / pgoutput| M[Staleness monitor]
-    M -->|GET marker by event_id| V
-    M --> H[/staleness /health /metrics]
+    W[Writer / load generator] -->|committed SQL transaction| PG[(PostgreSQL 16)]
+
+    subgraph Indexing path
+        PG -->|cdc_products_slot\npgoutput| R[CDC reader]
+        R -->|XADD cdc_events\napprox MAXLEN 500k| RS[(Redis Streams)]
+        RS -->|XREADGROUP batch\nXAUTOCLAIM recovery| I[Indexer workers ×4]
+        I -->|versioned mutation\nor tombstone| P[(Meilisearch\nproducts)]
+        I -->|immutable marker| V[(Meilisearch\ncdc_visibility)]
+    end
+
+    subgraph Measurement path
+        PG -->|staleness_monitor_slot\npgoutput| M[Staleness monitor]
+        M -->|GET marker by event_id| V
+        M --> H["/staleness  /health  /metrics"]
+    end
 ```
 
-PostgreSQL is read through two independent logical replication slots. The
+PostgreSQL is read through **two independent logical replication slots**. The
 monitor does not infer timing from Redis or trust an indexer-reported latency;
 it independently observes the source commit and probes the search system.
 
@@ -186,249 +107,314 @@ sequenceDiagram
     participant Visibility as Meilisearch cdc_visibility
     participant Monitor
 
-    Writer->>PostgreSQL: INSERT, UPDATE, or DELETE
-    PostgreSQL-->>Writer: Commit
+    Writer->>PostgreSQL: INSERT / UPDATE / DELETE
+    PostgreSQL-->>Writer: Commit (LSN + timestamp assigned)
+
     par Indexing path
         PostgreSQL-->>Reader: pgoutput on cdc_products_slot
-        Reader->>Redis: XADD deterministic event envelope
+        Reader->>Redis: XADD deterministic event envelope (MAXLEN ~500k)
         Reader->>PostgreSQL: Replication feedback after commit
-        Redis-->>Indexer: XREADGROUP batch
-        Indexer->>Indexer: Lock document and compare LSN
-        Indexer->>Products: Apply version or tombstone
+        Redis-->>Indexer: XREADGROUP batch (up to 50)
+        Indexer->>Indexer: Acquire per-key lock, compare LSN
+        Indexer->>Products: Apply version or tombstone (_lsn, _deleted)
         Products-->>Indexer: Product task completed
-        Indexer->>Visibility: Add event marker
+        Indexer->>Visibility: Write immutable marker (event_id, commit_lsn)
         Visibility-->>Indexer: Marker task completed
-        Indexer->>Redis: XACK
+        Indexer->>Redis: XACK + clear retry counter
     and Measurement path
         PostgreSQL-->>Monitor: Same commit on independent slot
-        loop Every STALENESS_POLL_SECONDS
-            Monitor->>Visibility: Get marker by event_id
+        loop Every STALENESS_POLL_SECONDS (default 0.12 s)
+            Monitor->>Visibility: GET marker by event_id
         end
         Visibility-->>Monitor: Matching event_id and commit_lsn
-        Monitor->>Monitor: Record visible_ts - commit_ts
-        Monitor->>PostgreSQL: Advance slot after commit resolves
+        Monitor->>Monitor: Record visible_ts − commit_ts as staleness sample
+        Monitor->>PostgreSQL: Advance slot after all commit events resolve
     end
 ```
+
+### Failure and recovery paths
+
+```mermaid
+flowchart TD
+    A[Indexer receives message] --> B{Apply succeeds?}
+    B -- yes --> C[XACK + write marker]
+    B -- no --> D[Increment retry counter\nleave message pending]
+    D --> E{attempts >= CDC_MAX_ATTEMPTS?}
+    E -- no --> F[XAUTOCLAIM reclaims\nafter CDC_CLAIM_IDLE_MS]
+    F --> A
+    E -- yes --> G[Write to cdc_events_dlq\nXACK source message]
+    G --> H[Manual replay after fix]
+
+    Reader[CDC reader disconnects] --> I[Exponential backoff\n1 s → 30 s max]
+    I --> J[Reconnect and resume\nfrom slot position]
+
+    Monitor[Monitor disconnects] --> K[Exponential backoff\n1 s → 30 s max]
+    K --> L[Recreate slot if absent\nresume from position]
+```
+
+---
+
+## SLO definition
+
+For event **E**:
+
+```
+staleness(E) = first_successful_marker_probe_ts(E) − postgres_commit_ts(E)
+```
+
+- **T₀** is PostgreSQL's transaction commit timestamp decoded from the
+  `pgoutput` commit message — not reader receipt time, Redis publish time,
+  indexer dequeue time, or Meilisearch task-submission time.
+- **T₁** is the monitor's first successful read of the event's immutable marker
+  from the `cdc_visibility` Meilisearch index. The marker is written only after
+  the product mutation task completes, making this a **conservative upper bound**
+  on product visibility.
+
+| Objective | Threshold |
+|---|---|
+| p99 commit-to-visibility | ≤ 1 000 ms |
+| p99 violation detection delay | ≤ 500 ms |
+
+---
 
 ## Components
 
 ### PostgreSQL
 
-Compose runs `postgres:16.4` with `wal_level=logical`,
-`track_commit_timestamp=on`, `max_replication_slots=10`, and
-`max_wal_senders=10`.
+Runs `postgres:16.4` with `wal_level=logical`, `track_commit_timestamp=on`,
+`max_replication_slots=10`, `max_wal_senders=10`.
 
-Initialization creates `public.products`, publication `cdc_pub`, logical slot
+Initialisation creates `public.products`, publication `cdc_pub`, logical slot
 `cdc_products_slot`, replication role `cdc_reader`, and restricted writer role
-`catalog_writer`. The monitor creates `staleness_monitor_slot` if absent.
+`catalog_writer`. The monitor creates `staleness_monitor_slot` on first start.
 
-The product schema contains `id`, unique `sku`, `name`, `description`,
-`category`, non-negative `price_cents`, `in_stock`, and `updated_at`. Replica
-identity is `DEFAULT`, so deletes reliably carry the primary-key identity but
-do not promise a complete old-row image.
+| Column | Type |
+|---|---|
+| `id` | `bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY` |
+| `sku` | `text NOT NULL UNIQUE` |
+| `name` | `text NOT NULL` |
+| `description` | `text NOT NULL` |
+| `category` | `text NOT NULL` |
+| `price_cents` | `integer NOT NULL CHECK (price_cents >= 0)` |
+| `in_stock` | `boolean NOT NULL` |
+| `updated_at` | `timestamptz NOT NULL DEFAULT clock_timestamp()` |
+
+Replica identity is `DEFAULT`, so deletes reliably carry the primary-key
+identity but do not guarantee a complete old-row image.
 
 ### Logical replication decoder
 
-`services/shared/pgoutput_decoder.py` implements the subset of PostgreSQL
-`pgoutput` needed by the schema: begin/commit, relation metadata, insert,
-update, delete, and tuple decoding. Origin, type, and truncate protocol messages
-are ignored. Row changes are buffered until commit, then emitted with the
-authoritative commit LSN and timestamp.
+`services/shared/pgoutput_decoder.py` implements the `pgoutput` subset needed
+by the schema: begin/commit, relation metadata, insert, update, delete, and
+tuple decoding. Origin, type, and truncate messages are ignored. Row changes are
+buffered until commit, then emitted with the authoritative commit LSN and
+timestamp.
 
-The event envelope contains:
+**Event envelope fields:**
 
 | Field | Meaning |
-| --- | --- |
-| `event_id` | Deterministic SHA-256 identity |
-| `op` | `c`, `u`, or `d` |
-| `source` | Database, schema, and table |
-| `pk` | Primary key, currently `id` |
-| `after` | New row for insert/update, otherwise `null` |
-| `before` | Old/key tuple for delete, otherwise `null` |
-| `commit_lsn` | Commit position and document version token |
-| `commit_ts_us` | Commit timestamp in epoch microseconds |
+|---|---|
+| `event_id` | Deterministic SHA-256 of `db\|schema\|table\|lsn\|xid\|seq` |
+| `op` | `c` insert, `u` update, `d` delete |
+| `source` | `{db, schema, table}` |
+| `pk` | Primary key (`id`) |
+| `after` | New row for insert/update; `null` on delete |
+| `before` | Old/key tuple for delete; `null` otherwise |
+| `commit_lsn` | Commit WAL position — version and idempotency token |
+| `commit_ts_us` | PostgreSQL commit timestamp in epoch µs — **T₀** |
 | `xid` | PostgreSQL transaction ID |
-| `captured_ts_us` | Reader-side decode time |
-| `published_ts_us` | Reader-side Redis publication time |
+| `captured_ts_us` | Reader decode time (diagnostic only) |
+| `published_ts_us` | Redis XADD time (diagnostic only) |
 
-PostgreSQL may mark unchanged TOAST-backed update fields unavailable. The
-single-event update path uses Meilisearch partial updates; the batch path merges
-decoded fields into the current indexed document.
+### CDC reader (`services/replication-consumer/reader.py`)
 
-### CDC reader
+Consumes `cdc_products_slot`, decodes committed transactions, appends JSON
+envelopes to `cdc_events` with approximate MAXLEN trimming (~500 k entries by
+default), and sends replication feedback after commit messages. Connection
+failures retry with exponential backoff 1 → 30 s.
 
-`services/replication-consumer/reader.py` consumes `cdc_products_slot`, decodes
-committed transactions, appends JSON envelopes to `cdc_events`, and sends
-replication feedback after commit messages. Connection failures retry with
-exponential backoff from 1 to 30 seconds.
+Internal endpoints on port 8082 (not host-published):
 
-Its internal `/ready` and `/health` endpoints on port 8082 report readiness,
-events published, and the last error. The port is not host-published by default.
+| Path | Purpose |
+|---|---|
+| `GET /ready` | Returns 200 when replication is active |
+| `GET /health` | Returns events published and last error |
 
 ### Redis
 
-Compose runs Redis 7.4.0 with password authentication, AOF persistence, and
-`appendfsync everysec`.
+Runs `redis:7.4.0-alpine` with password auth, AOF persistence
+(`appendfsync everysec`).
 
-Redis stores the `cdc_events` stream, consumer group `indexers`, pending
-entries, retry hash `cdc_events:retries`, dead-letter stream `cdc_events_dlq`,
-per-document locks, and the visibility-cleanup lock. The indexer uses
-`XAUTOCLAIM` to recover messages idle for `CDC_CLAIM_IDLE_MS`. Stream entries
-are not automatically trimmed.
+| Key | Purpose |
+|---|---|
+| `cdc_events` | Main event stream (MAXLEN ~500 k, approximate trim) |
+| `cdc_events_dlq` | Dead-letter stream (MAXLEN ~50 k, approximate trim) |
+| `cdc_events:retries` | Per-message attempt counter hash |
+| `cdc_events:document-lock:<id>` | Per-product serialisation lock |
+| `cdc_events:visibility-cleanup-lock` | Marker cleanup coordination |
 
-### Indexer
+### Indexer (`services/indexer/main.py`)
 
-`services/indexer/main.py` initializes:
+Defaults: 4 worker threads, batches up to 50 Redis events.
 
-- `products`, primary key `id`, filterable `_lsn` and `_deleted`;
-- `cdc_visibility`, primary key `event_id`, filterable `commit_ts_us`.
+Initialises:
+- `products` — primary key `id`, filterable `_lsn` and `_deleted`
+- `cdc_visibility` — primary key `event_id`, filterable `commit_ts_us`
 
-The default uses four worker threads and batches up to 50 Redis events. For a
-batch of distinct document IDs it acquires locks in sorted order, compares
-LSNs, submits one product task, waits for it, submits one marker task, waits for
-it, and acknowledges each message. Batches containing duplicate document IDs
-fall back to sequential single-message processing.
+**Batch path (distinct document IDs):** acquires per-key locks in sorted order,
+compares LSNs, submits one `add_documents` task for all products, waits, submits
+one marker task for all events, waits, then acknowledges each message.
 
-Logs include stream queue latency, product and marker task waits, batch size,
-lock wait, and processing duration. The internal port 8081 readiness endpoint
-also returns worker and batch counters.
+**Fallback path (duplicate document IDs in batch):** routes each message through
+the sequential single-event path to preserve explicit LSN ordering.
+
+**Retry and DLQ:** failed messages stay pending for `XAUTOCLAIM` recovery. At
+`CDC_MAX_ATTEMPTS` the event moves to `cdc_events_dlq` (with retention). Batch-
+level failures also increment per-message retry counters so events progress
+toward DLQ rather than looping silently.
+
+Internal endpoints on port 8081 (not host-published):
+
+| Path | Purpose |
+|---|---|
+| `GET /ready` | Returns 200 when workers are running |
+| `GET /health` | Returns worker counters and queue depth |
 
 ### Meilisearch
 
-Compose runs Meilisearch 1.12.0 in production mode with persistent storage and
-a required master key. `products` is the searchable materialized view;
-`cdc_visibility` is internal and must not be exposed to application clients.
+Runs `getmeili/meilisearch:v1.12.0` in production mode with persistent storage.
 
-Markers contain `event_id`, `document_id`, operation, commit LSN, commit
-timestamp, and result (`applied` or `superseded`). They default to seven-day
-retention. Retention must exceed the longest expected monitor outage.
+- `products` — the searchable materialised view for downstream consumers.
+  Application searches **must** filter `_deleted = false`.
+- `cdc_visibility` — internal marker index. **Must not be exposed to
+  application clients.**
 
-### Staleness monitor
+Markers contain `event_id`, `document_id`, `op`, `commit_lsn`,
+`commit_ts_us`, and `result` (`applied` or `superseded`). Default retention:
+7 days. Retention must exceed the longest expected monitor outage.
 
-`services/staleness-monitor/main.py` is independent of Redis and the reader. It
-consumes `staleness_monitor_slot`, tracks each event in memory, and polls
-`cdc_visibility` by event ID. Both event ID and commit LSN must match. It
-records staleness on the first successful probe and records a violation once an
-unresolved event exceeds the SLO.
+### Staleness monitor (`services/staleness-monitor/main.py`)
 
-Replication feedback advances only after every event in a commit has resolved.
-The monitor rejects commit timestamps over 60 seconds in the future or over 24
-hours in the past. The default rolling sample capacity is 10,000.
+Independent of Redis and the indexer. Consumes `staleness_monitor_slot`,
+tracks each event in memory, and polls `cdc_visibility` by `event_id` every
+`STALENESS_POLL_SECONDS`. Both `event_id` and `commit_lsn` must match.
 
-### Workload generator
+Records a staleness sample on the first successful probe. Records a violation
+once an unresolved event age exceeds the SLO. Replication feedback advances
+only after every event in a commit has resolved. Rejects commit timestamps
+>60 s in the future or >24 h in the past. Rolling sample capacity: 10 000.
 
-`load-generator/main.py` produces a deterministic mixture of approximately 60%
-inserts, 30% updates, and 10% deletes. It is paced by `LOADGEN_RATE` and seeded
-by `LOADGEN_SEED`.
+Published endpoints on port 8080:
 
-The psycopg2 connection uses `autocommit=True` without being used as a
-connection context manager. Each mutation is independently committed and gets
-its own commit LSN and timestamp. The connection closes explicitly in
-`finally`. This detail is essential to benchmark validity.
+| Path | Purpose |
+|---|---|
+| `GET /staleness` | JSON latency distribution and violation metrics |
+| `GET /metrics` | Prometheus text exposition with `# HELP`/`# TYPE` headers |
+| `GET /health` | 200 `ok` when ready and no active violation; 503 `STALE` on violation |
+| `GET /ready` | 200 when replication and probe are ready |
 
-## Failure and recovery behavior
+### Workload generator (`load-generator/main.py`)
 
-Reader and monitor failures mark their services unready and reconnect with
-bounded exponential backoff. Their logical slots retain WAL while disconnected.
+Produces ~60% inserts, ~30% updates, ~10% deletes, paced by `LOADGEN_RATE`
+and seeded by `LOADGEN_SEED`. Each mutation is an **independently committed**
+transaction with its own commit LSN and timestamp (`autocommit=True`, no
+connection context-manager wrapper).
 
-When single-message indexing fails, the indexer increments a retry counter and
-leaves the message pending for reclaim. At `CDC_MAX_ATTEMPTS` (default 5), it
-writes the original event and failure metadata to `cdc_events_dlq`, then
-acknowledges the source message. Batch-level failures are logged and remain
-pending; reclaim later uses the single-event path.
+---
 
-DLQ replay is manual: fix the cause, replay the original `event` field to
-`cdc_events`, and remove the DLQ entry only after confirming its visibility
-marker. Deterministic IDs and LSN checks protect newer document state.
+## Observability
 
-## Observability and endpoints
+### Staleness JSON (`/staleness`)
 
-| Service | Endpoint | Published | Purpose |
-| --- | --- | --- | --- |
-| Monitor | `GET /staleness` on 8080 | Yes | JSON latency and violation metrics |
-| Monitor | `GET /metrics` on 8080 | Yes | Prometheus text exposition |
-| Monitor | `GET /health` or `/ready` | Yes | Readiness plus active-SLO health |
-| Reader | `GET /health` or `/ready` on 8082 | No | Replication readiness and count |
-| Indexer | `GET /health` or `/ready` on 8081 | No | Readiness and worker counters |
-| Meilisearch | `GET /health` on 7700 | Yes | Search service availability |
+```json
+{
+  "sample_count": 300,
+  "p50_staleness_ms": 151.994,
+  "p95_staleness_ms": 207.060,
+  "p99_staleness_ms": 221.839,
+  "max_staleness_ms": 225.274,
+  "in_flight_count": 0,
+  "oldest_in_flight_age_ms": null,
+  "violation_count": 0,
+  "active_violation_count": 0,
+  "p99_detection_delay_ms": null,
+  "violation_duration_seconds": 0.0,
+  "replication_ready": true,
+  "probe_ready": true
+}
+```
 
-`/staleness` returns sample count, p50/p95/p99/max, in-flight count and oldest
-age, historical and active violations, p99 detection delay, active violation
-duration, and replication/probe readiness. Percentiles use nearest rank with a
-ceiling rank.
+### Prometheus metrics (`/metrics`)
 
-The monitor returns HTTP 200 with `status: "ok"` only when replication and
-probing are ready and no active violation exists. It returns HTTP 503 with
-`STALE` for an active violation or `unavailable` for dependency/readiness
-failure. Historical violations do not keep health failed after resolution.
+Every metric is emitted with `# HELP` and `# TYPE` headers:
 
-Prometheus metrics:
-
-| Metric | Meaning |
-| --- | --- |
-| `cdc_staleness_samples_total` | Samples retained in the rolling window |
-| `cdc_staleness_p50_milliseconds` | Rolling p50 |
-| `cdc_staleness_p95_milliseconds` | Rolling p95 |
-| `cdc_staleness_p99_milliseconds` | Rolling p99 |
-| `cdc_staleness_max_milliseconds` | Maximum retained staleness |
-| `cdc_staleness_in_flight` | Events awaiting markers |
-| `cdc_staleness_oldest_in_flight_milliseconds` | Oldest unresolved age |
-| `cdc_staleness_violations_total` | Violations since monitor start |
-| `cdc_staleness_active_violations` | Currently unresolved violations |
-| `cdc_staleness_detection_delay_p99_milliseconds` | p99 delay beyond SLO at detection |
-| `cdc_staleness_violation_duration_seconds` | Longest active violation duration |
+| Metric | Type | Meaning |
+|---|---|---|
+| `cdc_staleness_samples_total` | counter | Samples in rolling window |
+| `cdc_staleness_p50_milliseconds` | gauge | Rolling p50 |
+| `cdc_staleness_p95_milliseconds` | gauge | Rolling p95 |
+| `cdc_staleness_p99_milliseconds` | gauge | Rolling p99 — SLO threshold 1 000 ms |
+| `cdc_staleness_max_milliseconds` | gauge | Maximum retained staleness |
+| `cdc_staleness_in_flight` | gauge | Events awaiting markers |
+| `cdc_staleness_oldest_in_flight_milliseconds` | gauge | Oldest unresolved age |
+| `cdc_staleness_violations_total` | counter | Violations since monitor start |
+| `cdc_staleness_active_violations` | gauge | Currently unresolved violations |
+| `cdc_staleness_detection_delay_p99_milliseconds` | gauge | p99 delay beyond SLO at detection |
+| `cdc_staleness_violation_duration_seconds` | gauge | Longest active violation duration |
 
 Missing numeric values are exposed as `NaN`.
 
-## Docker Compose deployment
+### Structured logs
 
-The six persistent services are PostgreSQL, Redis, Meilisearch, `cdc-reader`,
-`indexer`, and `monitor`. `loadgen` is enabled only through the `workload`
-profile. Named volumes persist PostgreSQL, Redis, and Meilisearch data.
+All services emit structured JSON logs. Key log events:
 
-Python services run as non-root users with read-only root filesystems, `/tmp`
-tmpfs, init, `no-new-privileges`, and restart policies. Host-published ports
-bind only to `127.0.0.1`.
+| Event | Service | Key fields |
+|---|---|---|
+| `cdc_event_published` | reader | `commit_lsn`, `op`, `table`, `message_id` |
+| `indexer_event` | indexer | `result`, `commit_lsn`, `stream_queue_latency_ms`, `batch_size` |
+| `indexer_dead_lettered` | indexer | `message_id`, `attempts`, `reason` |
+| `staleness_sample` | monitor | `staleness_ms`, `commit_lsn`, `pk`, `op` |
+| `VIOLATION` | monitor | `commit_lsn`, `age_ms`, `detection_delay_ms` |
+
+---
 
 ## Repository structure
 
 ```text
-.
-├── docker-compose.yml
-├── .env.example
+FreshIndex/
+├── docker-compose.yml            # Full stack definition
+├── .env.example                  # All required and optional variables
+├── pyproject.toml                # Ruff lint and mypy config
+├── requirements-dev.txt          # Lint/type-check dev tools
 ├── docs/
-├── infra/postgres-init/
+│   ├── architecture.md           # Architecture and event contract
+│   ├── benchmark.md              # Benchmark procedure and scaling matrix
+│   ├── guarantee.md              # SLO definition and measurement semantics
+│   ├── limits.md                 # Build-phase limits and operational notes
+│   └── operations.md             # Rollout and operations runbook
+├── infra/postgres-init/          # SQL and shell init scripts
 ├── services/
-│   ├── replication-consumer/
-│   ├── indexer/
-│   ├── staleness-monitor/
+│   ├── replication-consumer/     # CDC reader service
+│   ├── indexer/                  # Meilisearch indexer service
+│   ├── staleness-monitor/        # Independent SLO monitor
 │   └── shared/pgoutput_decoder.py
-├── load-generator/
-├── tests/{unit,integration,slo}/
-└── demo/                  # portfolio evidence harness (see demo/README.md)
+├── load-generator/               # Deterministic workload generator
+├── tests/
+│   ├── unit/                     # Pure-Python unit tests (no Docker)
+│   ├── integration/              # Live pipeline integration test
+│   └── slo/verify_slo.py        # Formal SLO verifier
+└── demo/                         # Portfolio evidence harness
 ```
 
-## Portfolio demo harness
-
-`demo/` is a repeatable, single-command evidence demonstration of the real
-pipeline: happy path (Scenario A), same-row ordering with superseded-event
-evidence (Scenario B), SLO verification against the live monitor, and
-indexer failure/recovery (Scenario C). It produces a structured JSON evidence
-bundle under `demo/artifacts/` with no mock data and no secrets. Run it with
-`bash demo/run.sh`; see `demo/README.md` for the full procedure and honest
-limitations.
+---
 
 ## Prerequisites and setup
 
 - Docker Engine
-- Docker Compose v2, invoked as `docker compose`
+- Docker Compose v2 (`docker compose` — not legacy `docker-compose` v1)
 - `curl`
 - Python 3.12 for host-side unit and SLO commands
-- `psycopg2-binary` for host-side integration discovery/execution
-
-The validated host used Compose `2.40.3+ds1-0ubuntu1~24.04.1`. Legacy
-`docker-compose` v1 does not support the repository's native top-level `name`
-field and is not supported.
+- `psycopg2-binary` for host-side integration test
 
 ```bash
 cp .env.example .env
@@ -437,9 +423,8 @@ docker compose version
 docker compose config --quiet
 ```
 
-`.env` is ignored by Git. Docker Compose loads it automatically. Before running
-host-side commands that reference its variables, export it into the current
-shell:
+`.env` is ignored by Git. Before running host-side commands that reference its
+variables, export it:
 
 ```bash
 set -a
@@ -447,106 +432,108 @@ set -a
 set +a
 ```
 
+---
+
 ## Configuration
 
-| Variable | Default/example | Purpose |
-| --- | --- | --- |
-| `POSTGRES_USER` | `postgres` | Bootstrap administrator |
-| `POSTGRES_PASSWORD` | required | Administrator password |
-| `POSTGRES_DB` | `catalog` | Database name |
-| `CDC_DB_USER` | `cdc_reader` | Replication login |
-| `CDC_DB_PASSWORD` | required | Replication password |
-| `WRITER_DB_USER` | `catalog_writer` | Restricted writer |
-| `WRITER_DB_PASSWORD` | required | Writer password |
-| `REDIS_PASSWORD` | required | Redis password |
-| `MEILI_MASTER_KEY` | required | Meilisearch master key |
+### Required secrets
+
+| Variable | Purpose |
+|---|---|
+| `POSTGRES_PASSWORD` | PostgreSQL administrator password |
+| `CDC_DB_PASSWORD` | Replication role password |
+| `WRITER_DB_PASSWORD` | Restricted writer role password |
+| `REDIS_PASSWORD` | Redis password |
+| `MEILI_MASTER_KEY` | Meilisearch master key (≥16 random bytes) |
+
+### Key tunables
+
+| Variable | Default | Purpose |
+|---|---|---|
 | `POSTGRES_PORT` | `5432` | Loopback host port |
 | `REDIS_PORT` | `6379` | Loopback host port |
 | `MEILI_PORT` | `7700` | Loopback host port |
 | `MONITOR_PORT` | `8080` | Monitor host port |
+| `CDC_STREAM_MAXLEN` | `500000` | Approximate stream entry limit |
+| `CDC_DLQ_MAXLEN` | `50000` | Approximate DLQ entry limit |
 | `CDC_MAX_ATTEMPTS` | `5` | Attempts before DLQ |
 | `CDC_CLAIM_IDLE_MS` | `30000` | Pending reclaim age |
 | `CDC_KEY_LOCK_SECONDS` | `120` | Document lock timeout |
-| `INDEXER_PROCESSING_DELAY_MS` | `0` | Controlled-test delay only |
+| `INDEXER_PROCESSING_DELAY_MS` | `0` | **Controlled violation test only** — must be 0 in normal operation |
 | `INDEXER_BATCH_SIZE` | `50` | Maximum read batch |
 | `INDEXER_WORKERS` | `4` | Worker threads |
-| `VISIBILITY_MARKER_RETENTION_SECONDS` | `604800` | Marker retention |
+| `VISIBILITY_MARKER_RETENTION_SECONDS` | `604800` | Marker retention (7 days) |
 | `VISIBILITY_MARKER_CLEANUP_SECONDS` | `3600` | Cleanup interval |
 | `STALENESS_SLO_MS` | `1000` | Violation threshold |
-| `STALENESS_POLL_SECONDS` | `0.12` | Probe/ack interval |
+| `STALENESS_POLL_SECONDS` | `0.12` | Probe interval |
 | `SAMPLE_WINDOW` | `10000` | Rolling sample capacity |
 | `LOADGEN_RATE` | `5` | Mutations per second |
-| `LOADGEN_DURATION_SECONDS` | `60` | Duration; zero runs until stopped |
+| `LOADGEN_DURATION_SECONDS` | `60` | Duration (0 = until stopped) |
 | `LOADGEN_SEED` | `2026` | Deterministic seed |
 
-Compose supplies internal names including `cdc_products_slot`,
-`staleness_monitor_slot`, `cdc_pub`, `cdc_events`, `cdc_events_dlq`, `products`,
-and `cdc_visibility`.
+---
 
 ## Starting and stopping
 
 ```bash
+# Start the full pipeline (builds images on first run)
 docker compose up -d --build
+
+# Check all six services are healthy
 docker compose ps
+
+# Confirm monitor is ready
 curl -fsS http://localhost:${MONITOR_PORT:-8080}/health
+
+# Stream JSON latency metrics
 curl -fsS http://localhost:${MONITOR_PORT:-8080}/staleness
-```
 
-Structured logs:
-
-```bash
+# Structured logs for all pipeline services
 docker compose logs --no-color cdc-reader indexer monitor
 ```
 
 Stop while preserving volumes:
-
 ```bash
 docker compose down
 ```
 
 Destructively remove all persisted data:
-
 ```bash
 docker compose down -v
 ```
 
+---
+
 ## Tests
 
-Unit tests:
+### Unit tests (no Docker required)
 
 ```bash
 python -m unittest tests.unit.test_event_pipeline tests.unit.test_load_generator -v
 ```
 
-They cover event identity, LSN ordering, tombstones, partial updates, batching,
-marker matching, percentiles, dead letters, and workload transaction semantics.
+Covers: deterministic event IDs, LSN ordering, tombstones, superseded events,
+partial TOAST updates, batch task count, SDK document-model leak guard,
+percentile boundary behaviour, dead-letter promotion, and workload transaction
+semantics.
 
-Integration test with three explicit commits:
+### Integration test (requires running stack)
 
 ```bash
-set -a
-. ./.env
-set +a
+set -a; . ./.env; set +a
 RUN_INTEGRATION=1 \
 DATABASE_URL="postgresql://$WRITER_DB_USER:$WRITER_DB_PASSWORD@localhost:${POSTGRES_PORT:-5432}/$POSTGRES_DB" \
 MONITOR_URL="http://localhost:${MONITOR_PORT:-8080}/staleness" \
 python -m unittest tests.integration.test_pipeline -v
 ```
 
-Full discovery:
+Commits insert, update, and delete independently and waits for all three
+monitor samples, then confirms no active violation.
+
+Or run inside the reader image (no host `psycopg2-binary` required):
 
 ```bash
-python -m unittest discover -v
-```
-
-The integration module imports psycopg2 before applying its skip decorator, so
-host discovery requires `psycopg2-binary`. The test can instead run inside the
-reader image:
-
-```bash
-set -a
-. ./.env
-set +a
+set -a; . ./.env; set +a
 docker run --rm \
   --network freshindex_pipeline \
   -v "$PWD:/repo:ro" -w /repo -e PYTHONPATH=/repo \
@@ -557,215 +544,218 @@ docker run --rm \
   python -m unittest tests.integration.test_pipeline -v
 ```
 
+### Lint and type checks
+
+```bash
+pip install -r requirements-dev.txt
+ruff check services load-generator tests
+mypy --config-file pyproject.toml
+```
+
+---
+
 ## Workload and benchmark
 
-Run the intended representative workload:
-
+Run the representative workload:
 ```bash
 docker compose --profile workload run --rm loadgen
 ```
 
-Defaults are 5 independently committed mutations/second for 60 seconds. To
-override:
-
+Run with custom parameters:
 ```bash
 LOADGEN_RATE=10 LOADGEN_DURATION_SECONDS=30 LOADGEN_SEED=42 \
-docker compose --profile workload run --rm loadgen
+  docker compose --profile workload run --rm loadgen
 ```
 
-Run the unchanged formal verifier:
-
+Run the formal SLO verifier (unchanged):
 ```bash
 python tests/slo/verify_slo.py \
   --url "http://localhost:${MONITOR_PORT:-8080}/staleness" \
   --minimum-samples 100
 ```
 
-It fails if sample count is not reached or p99 exceeds 1000 ms. For comparable
-runs, clear prior samples; the fully isolated reset is:
-
+Fails if sample count is not reached or p99 > 1 000 ms. For comparable runs,
+reset state completely:
 ```bash
 docker compose down -v
 docker compose up -d --build
 ```
 
-Interpretation:
-
-- `sample_count` is retained rolling samples, not necessarily lifetime events.
-- p50/p95/p99/max are commit-to-first-marker-read latency.
-- `in_flight_count` is observed commits still missing markers.
-- `violation_count` is historical since monitor start.
-- `active_violation_count` is unresolved violations.
-- detection delay is age beyond the SLO when first detected; it is `null` when
-  no violation occurred.
-- workload throughput is `writes / duration_seconds`.
-
-Record Redis `XPENDING`, DLQ length, replication-slot lag, and Meilisearch task
-state alongside latency percentiles.
-
-Controlled violation test, disposable deployments only:
+### Controlled violation test (disposable deployment only)
 
 ```bash
 INDEXER_PROCESSING_DELAY_MS=1500 \
-docker compose up -d --build --force-recreate indexer
+  docker compose up -d --build --force-recreate indexer
 LOADGEN_RATE=1 LOADGEN_DURATION_SECONDS=5 \
-docker compose --profile workload run --rm loadgen
+  docker compose --profile workload run --rm loadgen
 python tests/slo/verify_slo.py \
   --url "http://localhost:${MONITOR_PORT:-8080}/staleness" \
   --minimum-samples 1 --violation-test
 ```
 
-Restore the processing delay to zero afterward. The violation verifier requires
-at least one breach and p99 detection delay at most 500 ms.
+Requires ≥1 violation and p99 detection delay ≤500 ms. **Restore
+`INDEXER_PROCESSING_DELAY_MS=0` afterward.**
 
-## Validation methodology and history
+---
 
-The final validation started the original Compose configuration with Compose
-v2, waited for six healthy services, ran unit and integration tests, reset the
-monitor sample window, ran 300 mutations at 5/second, verified 300 distinct
-commit LSNs and timestamps, ran the unchanged SLO verifier, and inspected Redis
-pending/DLQ state, both slot lags, PostgreSQL rows, Meilisearch documents, and
-service health.
+## Core guarantees and semantics
 
-### Controlled integration test
+### Ordering and idempotency
 
-The integration test commits insert, update, and delete separately. During the
-earlier investigation, they measured approximately 150.426 ms, 395.939 ms, and
-515.173 ms. The final post-fix test passed again in 0.638 seconds with no active
-violation. Three samples prove end-to-end behavior, not a statistical p99.
+- PostgreSQL commit LSN defines version order.
+- Redis Streams provides at-least-once delivery.
+- Event IDs are deterministic SHA-256 hashes — WAL replay produces the same ID.
+- Per-document Redis locks serialise concurrent workers.
+- The applied LSN is stored in every Meilisearch product document (`_lsn`).
+- Incoming events with LSN ≤ stored LSN are marked `superseded` and cannot
+  overwrite newer state.
+- Markers are written for both `applied` and `superseded` events so every
+  committed event remains measurable.
 
-### Earlier invalid burst measurement
+### Delete handling (tombstones)
 
-An earlier 120-write run reported p50 1721.855 ms, p95/p99/max 2569.273 ms, 91
-historical violations, and zero active violations at completion.
+Deletes are versioned tombstones, not physical removals:
 
-It was not a valid steady-rate p99. The generator used `with connection:` and
-set `autocommit=True` inside that psycopg2 context. Psycopg2 2.9 created one
-transaction for the context, so all 120 paced statements shared a transaction
-ID, commit LSN, and timestamp and entered CDC as one committed burst. The result
-measured burst-drain time, not 10 independent commits per second. It is retained
-here as burst evidence and must not be compared directly with steady-state SLO
-results.
+```json
+{"id": 7, "_lsn": "0/20", "_deleted": true}
+```
 
-### Corrected representative measurement
+Retaining `_lsn` prevents an older insert or update from resurrecting a deleted
+document. **Application searches must filter tombstones:**
 
-The generator now avoids the connection context manager, keeps autocommit, and
-closes explicitly in `finally`. A regression test prevents reintroduction of
-the invalid transaction scope. The corrected run produced 300 unique commit
-LSNs/timestamps and p99 221.839 ms with zero violations.
+```bash
+curl -sS -X POST http://localhost:7700/indexes/products/search \
+  -H "Authorization: Bearer $MEILI_MASTER_KEY" \
+  -H 'Content-Type: application/json' \
+  --data '{"q":"","filter":"_deleted = false"}'
+```
 
-## Important design decisions
+---
 
-- Stock PostgreSQL `pgoutput`, without a decoding extension.
-- PostgreSQL commit time as T0.
-- Independent monitoring slot rather than transport-derived timing.
-- Marker submission only after product task completion.
-- Per-event markers for rapid updates and deletes.
-- LSN-versioned documents and tombstones.
-- At-least-once transport plus idempotent application, not exactly once.
-- Loopback-only published ports.
-- Read-only, non-root Python service containers.
+## Failure and recovery
+
+| Failure | Behaviour |
+|---|---|
+| Reader disconnects | Marks unready, reconnects with backoff, resumes from slot |
+| Monitor disconnects | Marks unready, reconnects with backoff, recreates slot if absent |
+| Indexer message failure | Message stays pending; retry counter incremented |
+| Indexer batch failure | Per-message retry counters incremented; batch remains pending |
+| At `CDC_MAX_ATTEMPTS` | Event written to `cdc_events_dlq` (with MAXLEN trim); source acknowledged |
+
+**DLQ replay:** fix the root cause, replay the original `event` field to
+`cdc_events`, confirm its visibility marker in `cdc_visibility`, then remove
+the DLQ entry. Deterministic IDs and LSN checks make replay idempotent.
+
+---
+
+## Alerts
+
+Alert on:
+
+- `cdc_staleness_active_violations > 0` immediately.
+- `cdc_staleness_p99_milliseconds > 1000` over a representative window.
+- `cdc_staleness_detection_delay_p99_milliseconds > 500` after an injected test.
+- Any service readiness failure for more than two health intervals.
+- PostgreSQL replication-slot WAL lag approaching the disk budget.
+- Redis `XPENDING` growth, DLQ growth, or AOF persistence errors.
+- Meilisearch task failures, disk pressure, or unavailable health endpoint.
+
+---
+
+## Design decisions
+
+| Decision | Reason |
+|---|---|
+| Stock `pgoutput`, no extension | Available on unmodified PostgreSQL; no image changes needed |
+| PostgreSQL commit time as T₀ | Authoritative; not inflated by reader or transport jitter |
+| Independent monitoring slot | Cannot be gamed by the reader or indexer; measures real visibility |
+| Marker submission after product task | Conservative — ensures product is actually visible |
+| Per-event markers for all operations | Measures superseded events; handles rapid same-key bursts |
+| LSN-versioned tombstones | Prevents resurrection of deleted documents |
+| At-least-once + idempotent application | Simpler than exactly-once; correctness via LSN ordering |
+| Loopback-only published ports | No accidental external exposure |
+| Read-only non-root containers | Reduced container attack surface |
+| Approximate MAXLEN on streams | Bounded Redis memory without synchronous trimming overhead |
+
+---
 
 ## Known limitations
 
 - Only `public.products` is published and decoded.
-- The decoder covers current schema types and protocol forms, not all PostgreSQL
+- Decoder covers current schema types and protocol forms, not all PostgreSQL
   logical-replication features.
 - Replica identity `DEFAULT` does not provide complete delete before-images.
-- Redis streams and DLQ are not automatically trimmed.
-- Visibility retention is finite.
-- Monitor metrics are in memory and reset on process restart.
-- Slots can retain unbounded WAL during consumer outages.
-- Health endpoints are unauthenticated and rely on network isolation.
+- Monitor metrics are in-memory and reset on process restart.
+- Slots retain unbounded WAL during consumer outages.
+- Health endpoints are unauthenticated (rely on network isolation).
 - Compose is a single-host reference deployment without backup automation.
 - Meilisearch document count includes tombstones and differs from live rows.
 - The load generator updates/deletes only IDs inserted during that run.
 - Validation did not include external search traffic, large documents,
   multi-host networking, or rates above 5 commits/second.
-- The successful steady-state run had no violations, so its detection-delay
-  value was `null`; controlled detection validation requires an injected delay.
 
-## Troubleshooting
+---
 
-**Compose rejects the `name` field:** use `docker compose` v2. Do not edit the
-Compose file for legacy `docker-compose` v1.
+## Portfolio demo harness
 
-**Port already in use:** override the corresponding `.env` port, for example
-`MONITOR_PORT=18080`, and use that port in host requests.
+`demo/` is a repeatable, single-command evidence demonstration of the real
+pipeline:
 
-**Monitor unavailable:** inspect `docker compose ps` and logs for `monitor`,
-`postgres`, and `meilisearch`. `/health` includes readiness flags and last error.
+| Scenario | What it proves |
+|---|---|
+| **A — happy path** | One product mutation traced from PostgreSQL commit through Redis, indexer, Meilisearch product doc, visibility marker, and monitor staleness sample with real timings |
+| **B — ordering** | Same-row burst of 150 updates: final document equals newest committed LSN; older events are `superseded` |
+| **SLO** | `verify_slo.py` against the real monitor endpoint with a dedicated mixed-key workload |
+| **C — failure/recovery** | Indexer stopped; backlog and violations captured; restart; backlog → 0, pending → 0, DLQ → 0 |
 
-**PostgreSQL disk grows:** inspect replication-slot lag. Restore the stopped
-consumer; do not advance or drop a slot merely to silence lag.
+```bash
+docker compose up -d --build
+bash demo/run.sh
+```
 
-**Redis pending grows:** inspect indexer errors, `XPENDING`, retry state, DLQ,
-and Meilisearch task health before replay.
+See `demo/README.md` for the full procedure.
 
-**Deleted records appear:** application queries must filter `_deleted = false`.
+---
 
-**Discovery cannot import psycopg2:** install the declared dependency or run
-tests inside the reader image.
-
-**Too few SLO samples:** confirm the workload completed and monitor readiness is
-true; inspect monitor logs for missing markers or timestamp errors.
-
-## Development and operations workflow
+## Development workflow
 
 1. Keep `.env` local and never commit secrets.
-2. Run focused unit tests.
-3. Build the affected service image.
-4. Wait for health checks.
-5. Run the real integration test.
-6. Reset benchmark state or the monitor window.
-7. Run the representative workload and unchanged verifier.
-8. Inspect queue, DLQ, WAL lag, Meilisearch state, and logs.
-9. Preserve result JSON and logs for comparisons.
+2. Run `ruff check` and `mypy` before pushing.
+3. Run unit tests: `python -m unittest tests.unit.test_event_pipeline tests.unit.test_load_generator -v`
+4. Build the affected service image.
+5. Wait for health checks: `docker compose ps`
+6. Run the integration test.
+7. Reset benchmark state or the monitor window.
+8. Run the workload and the unchanged SLO verifier.
+9. Inspect queue depth, DLQ, WAL lag, Meilisearch state, and logs.
+10. Preserve result JSON and logs for comparisons.
 
-Production deployment additionally requires secret management, image scanning,
-immutable digests, PostgreSQL backups/WAL archiving, Redis AOF recovery tests,
-Meilisearch snapshots, storage alerts, and capacity planning. See
-`docs/operations.md` and `docs/benchmark.md`.
+---
 
-## Future Applications & Validation Targets
+## CI
 
-The following are planned downstream demonstrations. They are not implemented,
-deployed, or present in this repository today.
+GitHub Actions runs three jobs on every push and pull request:
 
-### Real-time Product Search
+| Job | Steps |
+|---|---|
+| `lint` | `ruff check` on all Python source |
+| `typecheck` | `mypy` with strict-ish config |
+| `unit` | `compileall` + full unit test suite |
 
-A future user-facing search application can query `products` with
-`_deleted = false`. It is intended to demonstrate product discovery and visible
-database changes within the measured staleness envelope.
+---
 
-### Live Inventory Dashboard
-
-A future dashboard can visualize availability and price changes. It is intended
-to exercise repeated updates, same-product ordering, tombstones, and visible
-lag under continuously changing inventory.
-
-### Event/Operations Observatory
-
-A future internal observability application can combine monitor metrics,
-replication-slot lag, Redis pending/DLQ state, and structured logs. It is
-intended to demonstrate operational diagnosis and violation investigation. It
-must not expose `cdc_visibility` directly to untrusted application clients.
-
-These applications should consume this infrastructure as their source of truth
-and add their own authorization, query contracts, interfaces, and tests. Future
-validation should preserve the commit-based SLO definition rather than replace
-it with frontend or API timing.
-
-## Future infrastructure work
+## Future work
 
 - Automate benchmark artifact capture in CI on a Docker-capable runner.
 - Add live restart-recovery, pending-reclaim, and DLQ replay integration tests.
 - Record the controlled 500 ms violation-detection test.
-- Run sustained capacity tests across the documented 1/2/4/8 indexer matrix.
-- Add stream and DLQ retention policies.
+- Run sustained capacity tests across the 1/2/4/8 indexer replica matrix.
 - Add authenticated or isolated operational endpoints for non-local use.
-- Expand decoder coverage only when new published tables/types are introduced.
+- Expand decoder coverage when new published tables/types are introduced.
 - Automate backup, restore, and full index rebuild procedures.
+- Persist monitor samples to Redis for cross-restart continuity.
+
+---
 
 ## License
 

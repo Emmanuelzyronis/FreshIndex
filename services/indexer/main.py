@@ -10,7 +10,7 @@ import socket
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -44,6 +44,7 @@ class Indexer:
         self.group = os.environ.get("REDIS_CONSUMER_GROUP", "indexers")
         self.consumer = os.environ.get("REDIS_CONSUMER_NAME", socket.gethostname())
         self.dead_letter_stream = os.environ.get("CDC_DLQ_STREAM", f"{self.stream}_dlq")
+        self.dlq_maxlen = int(os.environ.get("CDC_DLQ_MAXLEN", "50000"))
         self.retry_hash = os.environ.get("CDC_RETRY_HASH", f"{self.stream}:retries")
         self.max_attempts = int(os.environ.get("CDC_MAX_ATTEMPTS", "5"))
         self.claim_idle_ms = int(os.environ.get("CDC_CLAIM_IDLE_MS", "30000"))
@@ -155,17 +156,7 @@ class Indexer:
         }
 
     def apply(self, envelope: dict[str, Any]) -> str:
-        document_id = envelope["pk"]["id"]
-        lock = (
-            self.redis.lock(
-                f"{self.stream}:document-lock:{document_id}",
-                timeout=self.key_lock_seconds,
-                blocking_timeout=self.key_lock_seconds,
-            )
-            if hasattr(self, "redis")
-            else nullcontext()
-        )
-        with lock:
+        with self._lock_for(envelope["pk"]["id"]):
             return self._apply_locked(envelope)
 
     def _lock_for(self, document_id: Any):
@@ -264,10 +255,8 @@ class Indexer:
 
     def process_message(self, message_id: str, fields: dict[str, str]) -> None:
         dequeue_ts_us = time.time_ns() // 1_000
-        try:
+        with suppress(Exception):
             fields["_dequeue_ts_us"] = str(dequeue_ts_us)
-        except Exception:
-            pass
         try:
             envelope = json.loads(fields["event"])
             result = self.apply(envelope)
@@ -317,6 +306,8 @@ class Indexer:
                         "attempts": str(attempts),
                         "failed_ts_us": str(time.time_ns() // 1_000),
                     },
+                    maxlen=self.dlq_maxlen,
+                    approximate=True,
                 )
                 self.redis.xack(self.stream, self.group, message_id)
                 self.redis.hdel(self.retry_hash, message_id)
@@ -439,12 +430,29 @@ class Indexer:
                     separators=(",", ":"),
                 )
             )
+            for message_id, fields, _ in envelopes:
+                attempts = self.redis.hincrby(self.retry_hash, message_id, 1)
+                if attempts >= self.max_attempts:
+                    self.redis.xadd(
+                        self.dead_letter_stream,
+                        {
+                            "source_stream": self.stream,
+                            "source_message_id": message_id,
+                            "event": fields.get("event", ""),
+                            "error": "batch-level failure",
+                            "attempts": str(attempts),
+                            "failed_ts_us": str(time.time_ns() // 1_000),
+                        },
+                        maxlen=self.dlq_maxlen,
+                        approximate=True,
+                    )
+                    self.redis.xack(self.stream, self.group, message_id)
+                    self.redis.hdel(self.retry_hash, message_id)
+                    log("indexer_dead_lettered", message_id=message_id, attempts=attempts, reason="batch_error")
         finally:
             for lock in reversed(acquired):
-                try:
+                with suppress(Exception):
                     lock.release()
-                except Exception:
-                    pass
 
     def reclaim_pending(self) -> int:
         claimed = self.redis.xautoclaim(

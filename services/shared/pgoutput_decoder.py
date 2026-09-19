@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import struct
 import time
-import hashlib
 from dataclasses import dataclass
 from typing import Any
 

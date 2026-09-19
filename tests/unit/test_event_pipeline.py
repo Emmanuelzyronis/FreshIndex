@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import json
 import importlib.util
+import json
 import sys
 import types
 import unittest
 from pathlib import Path
-
 
 if importlib.util.find_spec("meilisearch") is None:
     meilisearch = types.ModuleType("meilisearch")
@@ -32,7 +31,6 @@ if importlib.util.find_spec("psycopg2") is None:
 
 from services.indexer.main import Indexer
 from services.shared.pgoutput_decoder import Column, PgoutputDecoder, Relation, RowChange
-
 
 monitor_path = Path(__file__).parents[2] / "services" / "staleness-monitor" / "main.py"
 monitor_spec = importlib.util.spec_from_file_location("staleness_monitor_main", monitor_path)
@@ -76,7 +74,7 @@ class RecordingRedis:
     def hincrby(self, key, field, amount):
         return 5
 
-    def xadd(self, stream, fields):
+    def xadd(self, stream, fields, **kwargs):
         self.dead_letters.append((stream, fields))
 
     def xack(self, stream, group, message_id):
@@ -277,6 +275,7 @@ class EventPipelineTest(unittest.TestCase):
         indexer.stream = "cdc_events"
         indexer.group = "indexers"
         indexer.dead_letter_stream = "cdc_events_dlq"
+        indexer.dlq_maxlen = 50000
         indexer.retry_hash = "cdc_events:retries"
         indexer.max_attempts = 5
         indexer.last_error = None

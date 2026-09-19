@@ -1,0 +1,31 @@
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
+ignore = [
+    "E501",   # line length handled by formatter
+    "B904",   # raise-without-from-inside-except — several intentional re-raises
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B"]
+# Binary protocol decoder uses intentionally compact one-liner style for
+# readability of the byte-by-byte parsing flow.
+"services/shared/pgoutput_decoder.py" = ["E701", "E702"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = false
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_return_any = false
+check_untyped_defs = true
+files = [
+    "services/indexer/main.py",
+    "services/replication-consumer/reader.py",
+    "services/staleness-monitor/main.py",
+    "services/shared/pgoutput_decoder.py",
+    "load-generator/main.py",
+]

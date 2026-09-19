@@ -53,6 +53,7 @@ class Reader:
         self.ready = False
         self.last_error: str | None = None
         self.emitted = 0
+        self.stream_maxlen = int(os.environ.get("CDC_STREAM_MAXLEN", "500000"))
         self.redis = redis.Redis.from_url(args.redis_url, decode_responses=True)
 
     def consume_once(self) -> None:
@@ -73,7 +74,12 @@ class Reader:
             for event in decoder.feed(payload):
                 event["published_ts_us"] = time.time_ns() // 1_000
                 envelope = json.dumps(event, separators=(",", ":"))
-                message_id = self.redis.xadd(self.args.stream, {"event": envelope})
+                message_id = self.redis.xadd(
+                    self.args.stream,
+                    {"event": envelope},
+                    maxlen=self.stream_maxlen,
+                    approximate=True,
+                )
                 log(
                     "cdc_event_published",
                     message_id=message_id,

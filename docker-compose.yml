@@ -89,6 +89,7 @@ services:
       CDC_PUBLICATION: cdc_pub
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
       CDC_STREAM: cdc_events
+      CDC_STREAM_MAXLEN: ${CDC_STREAM_MAXLEN:-500000}
       PORT: 8082
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8082/ready', timeout=2)"]
@@ -110,6 +111,7 @@ services:
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
       CDC_STREAM: cdc_events
       CDC_DLQ_STREAM: cdc_events_dlq
+      CDC_DLQ_MAXLEN: ${CDC_DLQ_MAXLEN:-50000}
       CDC_MAX_ATTEMPTS: ${CDC_MAX_ATTEMPTS:-5}
       CDC_CLAIM_IDLE_MS: ${CDC_CLAIM_IDLE_MS:-30000}
       CDC_KEY_LOCK_SECONDS: ${CDC_KEY_LOCK_SECONDS:-120}
