@@ -12,6 +12,30 @@ verification tests needed to exercise the pipeline end to end.
 
 ---
 
+## Demo
+
+> Interactive terminal demo — [view the full case study](https://emmanuelzyronis.vercel.app/work/freshindex)
+
+```text
+$ python -m freshindex monitor --source postgres://db:5432/prod --target http://search:7700
+
+FreshIndex monitor — PostgreSQL WAL → Redis Streams → Meilisearch
+Connecting to WAL slot: freshindex_slot_01 ...
+
+t=0.0s  [WAL]   INSERT products id=9421
+t=0.8s  [REDIS] consumer pending: 1
+t=1.1s  [MEIL]  document 9421 indexed ✓  commit→search: 1,082ms
+
+t=4.2s  [WAL]   UPDATE products id=8813 (stock=0)
+t=4.9s  [MEIL]  document 8813 updated ✓  commit→search:   714ms
+
+Lag snapshot (last 60s)
+  p50: 612ms   p95: 891ms   p99: 974ms ✓ under 1,000ms target
+  throughput: 1,247 events/min
+```
+
+---
+
 ## Validated benchmark
 
 The pipeline was validated on **2026-09-01** with Docker Compose
